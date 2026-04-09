@@ -1,0 +1,1 @@
+var fso=new ActiveXObject('Scripting.FileSystemObject'); var file=fso.OpenTextFile('temp_script_parse_segment.js',1); var src=file.ReadAll(); file.Close(); try { new Function(src); WScript.Echo('PARSER_OK'); } catch(e) { WScript.Echo('PARSER_ERROR: '+e.message); }

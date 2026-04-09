@@ -1,0 +1,3171 @@
+/* ===========================================================
+   SUPABASE CONFIG
+   =========================================================== */
+const SUPABASE_URL = 'https://jntylbzsgbbfenqmvmad.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImpudHlsYnpzZ2JiZmVucW12bWFkIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzIxMzQ3NzEsImV4cCI6MjA4NzcxMDc3MX0.GsoZ0dbvffoaNH-qRrJ--kmyEJpy9LlTc-cNl6ndAjo';
+const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+/* ===========================================================
+   ⚠️  MIGRATIONS SQL SUPABASE REQUISES
+   Exécutez ces requêtes dans Supabase → SQL Editor
+   ===========================================================
+
+-- 1. Mise à jour table cotisations (ajouter colonnes manquantes)
+ALTER TABLE cotisations
+  ADD COLUMN IF NOT EXISTS member_id TEXT REFERENCES membres(id) ON DELETE CASCADE,
+  ADD COLUMN IF NOT EXISTS description TEXT DEFAULT 'Cotisation',
+  ADD COLUMN IF NOT EXISTS date TIMESTAMPTZ DEFAULT now(),
+  ADD COLUMN IF NOT EXISTS month INTEGER,
+  ADD COLUMN IF NOT EXISTS year INTEGER,
+  ADD COLUMN IF NOT EXISTS day INTEGER,
+  ADD COLUMN IF NOT EXISTS time TEXT;
+
+-- Remplir month/year/day depuis created_at pour les lignes existantes
+UPDATE cotisations SET
+  month = EXTRACT(MONTH FROM created_at)::INTEGER - 1,
+  year  = EXTRACT(YEAR  FROM created_at)::INTEGER,
+  day   = EXTRACT(DAY   FROM created_at)::INTEGER
+WHERE month IS NULL;
+
+-- Si vous aviez user_id au lieu de member_id, migrez :
+-- UPDATE cotisations SET member_id = user_id WHERE member_id IS NULL;
+
+-- 2. Créer table rapports (si elle n'existe pas)
+CREATE TABLE IF NOT EXISTS rapports (
+  id           TEXT PRIMARY KEY,
+  type         TEXT NOT NULL CHECK (type IN ('monthly','annual')),
+  period_key   TEXT NOT NULL,
+  total_amount INTEGER NOT NULL DEFAULT 0,
+  entries      JSONB,
+  generated_at TIMESTAMPTZ DEFAULT now(),
+  updated_at   TIMESTAMPTZ DEFAULT now()
+);
+ALTER TABLE rapports ENABLE ROW LEVEL SECURITY;
+CREATE POLICY "Lecture publique rapports" ON rapports FOR SELECT USING (true);
+CREATE POLICY "Insertion rapports" ON rapports FOR INSERT WITH CHECK (true);
+CREATE POLICY "Mise à jour rapports" ON rapports FOR UPDATE USING (true);
+
+   =========================================================== */
+
+/* ===========================================================
+   DATA LAYER — Supabase backend + in-memory cache
+   =========================================================== */
+let DB = {
+  membres: [],
+  meetings: [],
+  cotisations: [],
+  notes: [],
+  annonces: []
+};
+let currentUser = null;
+let croppedPhotoData = null;
+let rawPhotoFile = null;
+let rawPhotoObjectUrl = null;
+
+// Verrouillage pour éviter double-clique sur enregistrement/cotisation/retrait
+let isSavingCotisation = false;
+let isSavingTotalWithdrawal = false;
+let isSavingWithdrawal = false;
+let isSavingMember = false;
+
+// Protection contre les clics multiples pour toutes les actions importantes
+let isSavingMeeting = false;
+let isSavingAnnonce = false;
+let isSavingNote = false;
+let isLoggingIn = false;
+let isLoggingOut = false;
+let isSavingSettings = false;
+
+/* Load all data from Supabase into local cache */
+async function loadLocalData() {
+  try {
+    const [usersRes, meetingsRes, cotisationsRes, notesRes] = await Promise.all([
+      sb.from('membres').select('*'),
+      sb.from('meetings').select('*'),
+      sb.from('cotisations').select('*'),
+      sb.from('notes').select('*')
+    ]);
+    if (usersRes.data) DB.membres = usersRes.data.map(mapUserFromDB);
+    if (meetingsRes.data) DB.meetings = meetingsRes.data.map(mapMeetingFromDB);
+    if (cotisationsRes.data) DB.cotisations = cotisationsRes.data.map(mapCotisationFromDB);
+    if (notesRes.data) DB.notes = notesRes.data.map(mapNoteFromDB);
+    checkAndResetBalances();
+    try { renderMembers(); renderMeetings(); renderHomeMeetings(); renderCotisations('all'); renderNotes(); } catch (e) {}
+  } catch (e) { console.warn('Supabase load failed', e); }
+}
+
+/* --- Field mappers: DB snake_case → app camelCase --- */
+function mapUserFromDB(u) {
+  return { id: u.id, nom: u.nom, prenom: u.prenom, phone: u.phone, pin: u.pin, role: u.role, avatar: u.avatar, createdAt: u.created_at, soldeMonthly: u.solde_monthly || 0, soldeAnnuel: u.solde_annuel || 0, lastMonthReset: u.last_month_reset, lastYearReset: u.last_year_reset };
+}
+function mapMeetingFromDB(m) {
+  return { id: m.id, date: m.date, titles: m.titles || [], createdBy: m.created_by, createdAt: m.created_at };
+}
+function mapCotisationFromDB(c) {
+  // Priorité à member_id (nouveau schéma), fallback sur user_id (ancien schéma)
+  var mId = c.member_id || c.user_id;
+  // Reconstruire month/year/day à partir de created_at si non stockés
+  var dateRef = c.date ? new Date(c.date) : (c.created_at ? new Date(c.created_at) : new Date());
+  var month = (c.month !== undefined && c.month !== null) ? c.month : dateRef.getMonth();
+  var year  = (c.year  !== undefined && c.year  !== null) ? c.year  : dateRef.getFullYear();
+  var day   = (c.day   !== undefined && c.day   !== null) ? c.day   : dateRef.getDate();
+  var time  = c.time || dateRef.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+  return {
+    id: c.id,
+    memberId: mId,
+    meetingId: c.meeting_id || null,
+    amount: c.amount,
+    description: c.description || c.note || 'Cotisation',
+    date: c.date || c.created_at,
+    month: month,
+    year: year,
+    day: day,
+    time: time,
+    createdAt: c.created_at
+  };
+}
+function mapNoteFromDB(n) {
+  return { id: n.id, userId: n.user_id, meetingId: n.meeting_id, title: n.title, content: n.content, titleIndex: n.title_index, createdAt: n.created_at, updatedAt: n.updated_at };
+}
+
+/* --- Function to reset balances (monthly and yearly) --- */
+function checkAndResetBalances() {
+  var now = new Date();
+  var today = now.toISOString().split('T')[0]; // YYYY-MM-DD format
+  var currentMonth = now.getMonth();
+  var currentYear = now.getFullYear();
+
+  DB.membres.forEach(function(member) {
+    var needsUpdate = false;
+
+    // Extract month and year from last reset dates if they exist
+    var lastMonthReset = member.lastMonthReset ? new Date(member.lastMonthReset) : null;
+    var lastYearReset = member.lastYearReset ? new Date(member.lastYearReset) : null;
+
+    // Check if we need to reset monthly balance (if month changed)
+    if (!lastMonthReset || lastMonthReset.getMonth() !== currentMonth || lastMonthReset.getFullYear() !== currentYear) {
+      member.soldeMonthly = 0;
+      member.lastMonthReset = now.toISOString();
+      needsUpdate = true;
+    }
+
+    // Check if we need to reset annual balance (if year changed)
+    if (!lastYearReset || lastYearReset.getFullYear() !== currentYear) {
+      member.soldeAnnuel = 0;
+      member.lastYearReset = now.toISOString();
+      needsUpdate = true;
+    }
+
+    // Update in Supabase if changes were made
+    if (needsUpdate) {
+      sb.from('membres').update({
+        solde_monthly: member.soldeMonthly,
+        solde_annuel: member.soldeAnnuel,
+        last_month_reset: member.lastMonthReset,
+        last_year_reset: member.lastYearReset
+      }).eq('id', member.id).then(function() {
+        console.log('Balance reset for member:', member.id);
+      }).catch(function(err) {
+        console.warn('Failed to reset balance for member:', member.id, err);
+      });
+    }
+  });
+}
+
+/* --- Auth init --- */
+async function initAuth() {
+  await loadLocalData();
+  currentUser = null;
+  showScreen('loginScreen');
+  // Set up periodic check for balance resets (every minute)
+  setInterval(function() {
+    checkAndResetBalances();
+  }, 60000);
+}
+
+/* --- CRUD helpers --- */
+async function insertUser(user) {
+  var now = new Date().toISOString();
+  const { data, error } = await sb.from('membres').insert({
+    id: user.id, nom: user.nom, prenom: user.prenom, phone: user.phone,
+    pin: user.pin, role: user.role, avatar: user.avatar || null,
+    solde_monthly: 0, solde_annuel: 0,
+    last_month_reset: now, last_year_reset: now
+  }).select();
+
+  if (!error && data && data[0]) {
+    DB.membres.push(mapUserFromDB(data[0]));
+    renderMembers();
+    return { data, error };
+  }
+
+  // Fallback local lorsque Supabase n'est pas disponible
+  console.warn('insertUser supabase failed, fallback en local', error);
+  var localUser = {
+    id: user.id,
+    nom: user.nom,
+    prenom: user.prenom,
+    phone: user.phone,
+    pin: user.pin,
+    role: user.role,
+    avatar: user.avatar || '',
+    createdAt: new Date().toISOString(),
+    soldeMonthly: 0,
+    soldeAnnuel: 0,
+    lastMonthReset: now,
+    lastYearReset: now
+  };
+  DB.membres.push(localUser);
+  renderMembers();
+  return { data: data || [localUser], error };
+}
+
+async function updateUser(user) {
+  const { data, error } = await sb.from('membres').update({
+    nom: user.nom, prenom: user.prenom, phone: user.phone,
+    pin: user.pin, role: user.role, avatar: user.avatar || null
+  }).eq('id', user.id).select();
+  if (!error) {
+    var idx = DB.membres.findIndex(function(u){ return u.id === user.id; });
+    if (idx !== -1) DB.membres[idx] = user;
+    renderMembers();
+
+    // Make sure current user avatar is consistent everywhere
+    if (currentUser && currentUser.id === user.id) {
+      currentUser.avatar = user.avatar;
+      document.getElementById('topBarAvatar').src = user.avatar;
+      document.getElementById('sidebarAvatar').src = user.avatar;
+      document.getElementById('settingsAvatar').src = user.avatar;
+      renderCotisations('all');
+    }
+  }
+  return { data, error };
+}
+
+async function insertMeeting(meeting) {
+  const { data, error } = await sb.from('meetings').insert({
+    id: meeting.id, date: meeting.date, titles: meeting.titles, created_by: meeting.createdBy || null
+  }).select();
+  if (!error && data) {
+    DB.meetings.push(mapMeetingFromDB(data[0]));
+    renderMeetings(); renderHomeMeetings();
+  }
+  return { data, error };
+}
+
+async function deleteMeetingData(id) {
+  const { error } = await sb.from('meetings').delete().eq('id', id);
+  if (!error) {
+    DB.meetings = DB.meetings.filter(function(m){ return m.id !== id; });
+    renderMeetings(); renderHomeMeetings();
+  }
+  return { error };
+}
+
+async function insertCotisation(c) {
+  // Payload complet vers Supabase
+  const payload = {
+    id: c.id,
+    member_id: c.memberId,
+    meeting_id: c.meetingId || null,
+    amount: c.amount,
+    description: c.description || 'Cotisation',
+    date: c.date,
+    month: c.month,
+    year: c.year,
+    day: c.day,
+    time: c.time
+  };
+
+  console.log('[Cotisation] Tentative insertion Supabase :', payload);
+
+  const { data, error } = await sb.from('cotisations').insert(payload).select();
+
+  if (error) {
+    console.error('[Cotisation] ERREUR Supabase :', error.message, error.details, error.hint);
+    // Fallback : conserver en cache local pour affichage immédiat
+    DB.cotisations.push(c);
+    renderCotisations('all');
+    showToast('⚠️ Erreur DB : ' + error.message + ' (enregistré localement)', 'warning');
+    // Retourner succès fonctionnel pour ne pas bloquer la logique d'interface
+    return { data: [c], error: null };
+  }
+
+  console.log('[Cotisation] Insertion réussie :', data);
+  if (data && data[0]) {
+    DB.cotisations.push(mapCotisationFromDB(data[0]));
+  } else {
+    DB.cotisations.push(c);
+  }
+  renderCotisations('all');
+  return { data, error };
+}
+
+/* Met à jour les totaux de rapport mensuel/annuel dans Supabase (table rapports) */
+async function upsertRapport(type, periodKey, totalAmount, entries) {
+  const payload = {
+    id: type + '_' + periodKey,
+    type: type,                        // 'monthly' ou 'annual'
+    period_key: periodKey,             // ex: '2026-03' ou '2026'
+    total_amount: totalAmount,
+    entries: JSON.stringify(entries),  // détail par membre
+    generated_at: new Date().toISOString()
+  };
+
+  console.log('[Rapport] Upsert Supabase :', payload);
+
+  const { data, error } = await sb.from('rapports').upsert(payload, { onConflict: 'id' }).select();
+  if (error) {
+    console.error('[Rapport] ERREUR Supabase :', error.message, error.details, error.hint);
+    // Si la table n'existe pas encore, on l'indique clairement
+    if (error.code === '42P01') {
+      console.warn('[Rapport] La table "rapports" n\'existe pas encore dans Supabase. Créez-la avec le script SQL fourni.');
+    }
+  } else {
+    console.log('[Rapport] Upsert réussi :', data);
+  }
+  return { data, error };
+}
+
+/* Supprime toutes les cotisations d'un membre pour un mois/année donnés (local + Supabase) */
+async function deleteCotisationsOfMonth(memberId, month, year) {
+  // Récupérer les IDs à supprimer dans le cache local
+  var toDelete = DB.cotisations.filter(function(c) {
+    return c.memberId === memberId && c.month === month && c.year === year;
+  }).map(function(c) { return c.id; });
+
+  if (toDelete.length === 0) return { error: null };
+
+  // Supprimer dans Supabase (on utilise .in() pour supprimer plusieurs lignes)
+  const { error } = await sb.from('cotisations').delete().in('id', toDelete);
+
+  // Même si erreur réseau, on met à jour le cache local
+  DB.cotisations = DB.cotisations.filter(function(c) {
+    return !(c.memberId === memberId && c.month === month && c.year === year);
+  });
+
+  if (error) console.error('deleteCotisationsOfMonth error', error);
+  return { error };
+}
+
+async function insertNote(n) {
+  const { data, error } = await sb.from('notes').insert({
+    id: n.id, user_id: n.userId, meeting_id: n.meetingId || null,
+    title: n.title || null, content: n.content, title_index: n.titleIndex !== undefined ? n.titleIndex : null
+  }).select();
+  if (!error && data) {
+    DB.notes.push(mapNoteFromDB(data[0]));
+    renderNotes();
+  }
+  return { data, error };
+}
+
+async function deleteNotesForMeetingData(meetingKey) {
+  let error = null;
+  if (meetingKey.startsWith('free_')) {
+    var noteId = meetingKey.replace('free_', '');
+    const res = await sb.from('notes').delete().eq('id', noteId);
+    error = res.error;
+    if (!error) DB.notes = DB.notes.filter(function(n){ return n.id !== noteId; });
+  } else {
+    const res = await sb.from('notes').delete().eq('meeting_id', meetingKey).eq('user_id', currentUser.id);
+    error = res.error;
+    if (!error) DB.notes = DB.notes.filter(function(n){ return n.meetingId !== meetingKey || n.userId !== currentUser.id; });
+  }
+  renderNotes();
+  return { error };
+}
+
+/* Initialize */
+initAuth();
+
+/* ---- Dark Mode Detection ---- */
+(function initTheme() {
+  if (window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches) {
+    document.documentElement.classList.add('dark');
+  }
+  window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function(event) {
+    if (event.matches) {
+      document.documentElement.classList.add('dark');
+    } else {
+      document.documentElement.classList.remove('dark');
+    }
+    syncThemeToggle();
+  });
+})();
+
+function syncThemeToggle() {
+  var toggle = document.getElementById('themeToggle');
+  if (toggle) {
+    toggle.checked = document.documentElement.classList.contains('dark');
+  }
+}
+
+function toggleTheme() {
+  document.documentElement.classList.toggle('dark');
+}
+
+/* ---- Screen navigation ---- */
+function showScreen(id) {
+  var screens = ['loginScreen', 'registerScreen', 'dashboardScreen'];
+  screens.forEach(function(s) {
+    var el = document.getElementById(s);
+    if (s === id) {
+      el.classList.remove('hidden');
+    } else {
+      el.classList.add('hidden');
+    }
+  });
+}
+
+/* ---- Toast ---- */
+function showToast(msg, type = 'success') {
+  var t = document.getElementById('toast');
+  var progress = document.getElementById('toastProgress');
+  var message = document.getElementById('toastMessage');
+  
+  // Reset classes
+  t.classList.remove('error', 'success');
+  
+  // Set type
+  t.classList.add(type);
+  
+  // Reset progress bar
+  progress.style.width = '0%';
+  
+  // Set message
+  message.textContent = msg;
+  
+  // Show toast
+  t.classList.add('show');
+  
+  // Hide after 3 seconds (progress bar takes 2.5s to fill)
+  setTimeout(function() { 
+    t.classList.remove('show');
+  }, 3000);
+}
+
+/* ---- Confirm dialog ---- */
+function showConfirmDialog(msg, onConfirm) {
+  var d = document.getElementById('confirmDialog');
+  document.getElementById('confirmMessage').textContent = msg;
+  d.classList.remove('hidden');
+  var cancelBtn = document.getElementById('confirmCancel');
+  var okBtn = document.getElementById('confirmOk');
+  function cleanup() {
+    d.classList.add('hidden');
+    cancelBtn.removeEventListener('click', onCancel);
+    okBtn.removeEventListener('click', onOk);
+  }
+  function onCancel() { cleanup(); }
+  function onOk() { cleanup(); onConfirm(); }
+  cancelBtn.addEventListener('click', onCancel);
+  okBtn.addEventListener('click', onOk);
+}
+
+/* ===========================================================
+   PIN INPUT HELPER
+   =========================================================== */
+document.addEventListener('input', function(e) {
+  if (e.target.classList.contains('pin-box')) {
+    var val = e.target.value.replace(/\D/g, '');
+    e.target.value = val;
+    if (val.length === 1) {
+      var idx = parseInt(e.target.getAttribute('data-index'));
+      var group = e.target.getAttribute('data-pin');
+      var next = document.querySelector('[data-pin="' + group + '"][data-index="' + (idx + 1) + '"]');
+      if (next) next.focus();
+    }
+  }
+});
+
+document.addEventListener('keydown', function(e) {
+  if (e.target.classList.contains('pin-box') && e.key === 'Backspace' && e.target.value === '') {
+    var idx = parseInt(e.target.getAttribute('data-index'));
+    var group = e.target.getAttribute('data-pin');
+    var prev = document.querySelector('[data-pin="' + group + '"][data-index="' + (idx - 1) + '"]');
+    if (prev) { prev.focus(); prev.value = ''; }
+  }
+});
+
+/* PHONE INPUT AUTO-TAB */
+document.addEventListener('input', function(e) {
+  if (e.target.classList.contains('phone-part')) {
+    e.target.value = e.target.value.replace(/\D/g, '');
+    if (e.target.value.length === 2) {
+      var next = e.target.nextElementSibling;
+      if (next && next.classList.contains('phone-part')) next.focus();
+    }
+  }
+});
+
+function getPin(group) {
+  var pins = document.querySelectorAll('[data-pin="' + group + '"]');
+  var val = '';
+  pins.forEach(function(p) { val += p.value; });
+  return val;
+}
+
+function getPhone(prefix) {
+  var p1 = document.getElementById(prefix + '1').value;
+  var p2 = document.getElementById(prefix + '2').value;
+  var p3 = document.getElementById(prefix + '3').value;
+  var p4 = document.getElementById(prefix + '4').value;
+  return p1 + ' ' + p2 + ' ' + p3 + ' ' + p4;
+}
+
+function setPhoneParts(prefix, phone) {
+  var parts = phone.split(' ');
+  if (parts.length === 4) {
+    document.getElementById(prefix + '1').value = parts[0];
+    document.getElementById(prefix + '2').value = parts[1];
+    document.getElementById(prefix + '3').value = parts[2];
+    document.getElementById(prefix + '4').value = parts[3];
+  }
+}
+
+/* ===========================================================
+   ROLE SELECTOR
+   =========================================================== */
+var selectedRole = 'member';
+
+function selectRole(role) {
+  selectedRole = role;
+  var memberEl = document.getElementById('roleMember');
+  var adminEl = document.getElementById('roleAdmin');
+  var adminField = document.getElementById('adminPassField');
+  if (role === 'member') {
+    memberEl.classList.add('active');
+    adminEl.classList.remove('active');
+    adminField.classList.remove('show');
+  } else {
+    adminEl.classList.add('active');
+    memberEl.classList.remove('active');
+    adminField.classList.add('show');
+  }
+}
+
+/* ===========================================================
+   PHOTO UPLOAD & CROP
+   =========================================================== */
+let cropState = {
+  source: 'register',
+  img: null,
+  imgNaturalWidth: 0,
+  imgNaturalHeight: 0,
+  imgDisplayWidth: 0,
+  imgDisplayHeight: 0,
+  imgDisplayX: 0,
+  imgDisplayY: 0,
+  scaleRatio: 1,
+  cropBox: null,
+  cropBoxX: 50,
+  cropBoxY: 50,
+  cropBoxW: 200,
+  cropBoxH: 200,
+  dragging: false,
+  resizing: false,
+  activeHandle: null,
+  startX: 0,
+  startY: 0,
+  startBoxX: 0,
+  startBoxY: 0,
+  startBoxW: 0,
+  startBoxH: 0
+};
+
+function handlePhotoSelect(event) {
+  var file = event.target && event.target.files ? event.target.files[0] : null;
+  if (!file) return;
+  // Prefer object URL to avoid heavy dataURL decoding issues on some platforms
+  try {
+    // Revoke previous object URL if any
+    if (rawPhotoObjectUrl) { try { URL.revokeObjectURL(rawPhotoObjectUrl); } catch (e) {} rawPhotoObjectUrl = null; }
+    rawPhotoObjectUrl = URL.createObjectURL(file);
+    var img = new Image();
+    img.onload = function() {
+      cropState.img = img;
+      cropState.imgNaturalWidth = img.naturalWidth || img.width;
+      cropState.imgNaturalHeight = img.naturalHeight || img.height;
+
+      var viewport = document.getElementById('cropViewport');
+      var vw = viewport.clientWidth || 300;
+      var vh = viewport.clientHeight || 300;
+      var scale = Math.min(vw / cropState.imgNaturalWidth, vh / cropState.imgNaturalHeight, 1);
+
+      cropState.imgDisplayWidth = Math.round(cropState.imgNaturalWidth * scale);
+      cropState.imgDisplayHeight = Math.round(cropState.imgNaturalHeight * scale);
+      cropState.imgDisplayX = Math.round((vw - cropState.imgDisplayWidth) / 2);
+      cropState.imgDisplayY = Math.round((vh - cropState.imgDisplayHeight) / 2);
+      cropState.scaleRatio = cropState.imgNaturalWidth / cropState.imgDisplayWidth;
+
+      // initialize crop box centered on image
+      cropState.cropBoxW = Math.min(200, cropState.imgDisplayWidth - 20);
+      cropState.cropBoxH = Math.min(200, cropState.imgDisplayHeight - 20);
+      cropState.cropBoxX = cropState.imgDisplayX + Math.round((cropState.imgDisplayWidth - cropState.cropBoxW) / 2);
+      cropState.cropBoxY = cropState.imgDisplayY + Math.round((cropState.imgDisplayHeight - cropState.cropBoxH) / 2);
+
+      // update the DOM image inside the viewport so user can see what they are cropping
+      var cropImgEl = document.getElementById('cropImage');
+      if (cropImgEl) {
+        cropImgEl.src = rawPhotoObjectUrl || img.src;
+        // apply computed size/position for consistent cropping behaviour
+        cropImgEl.style.width = cropState.imgDisplayWidth + 'px';
+        cropImgEl.style.height = cropState.imgDisplayHeight + 'px';
+        cropImgEl.style.left = cropState.imgDisplayX + 'px';
+        cropImgEl.style.top = cropState.imgDisplayY + 'px';
+      }
+
+      updateCropBoxView();
+      updatePreview();
+      document.getElementById('cropModal').classList.remove('hidden');
+    };
+    img.onerror = function(e) { console.warn('image decode failed', e); showToast('Impossible de lire l\'image sélectionnée', 'error'); };
+    img.src = rawPhotoObjectUrl;
+  } catch (e) {
+    console.error('object URL fallback failed', e);
+    showToast('Erreur lors de la lecture du fichier', 'error');
+  }
+}
+
+function handleSettingsPhoto(event) {
+  cropState.source = 'settings';
+  handlePhotoSelect(event);
+}
+
+function updateCropBoxView() {
+  if (!cropState.cropBox) cropState.cropBox = document.getElementById('cropBox');
+  cropState.cropBox.style.left = `${cropState.cropBoxX}px`;
+  cropState.cropBox.style.top = `${cropState.cropBoxY}px`;
+  cropState.cropBox.style.width = `${cropState.cropBoxW}px`;
+  cropState.cropBox.style.height = `${cropState.cropBoxH}px`;
+}
+
+(function() {
+  const viewport = document.getElementById('cropViewport');
+  if (!viewport) return;
+
+  function getEventCoords(e) {
+    const rect = viewport.getBoundingClientRect();
+    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
+    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  }
+
+  function onDragStart(e) {
+    e.preventDefault();
+    const coords = getEventCoords(e);
+    cropState.startX = coords.x;
+    cropState.startY = coords.y;
+    const target = e.target;
+
+    if (target.classList.contains('crop-handle')) {
+      cropState.resizing = true;
+      cropState.activeHandle = target.dataset.handle;
+    } else if (target.id === 'cropBox') {
+      cropState.dragging = true;
+    } else {
+      return;
+    }
+
+    cropState.startBoxX = cropState.cropBoxX;
+    cropState.startBoxY = cropState.cropBoxY;
+    cropState.startBoxW = cropState.cropBoxW;
+    cropState.startBoxH = cropState.cropBoxH;
+
+    window.addEventListener('mousemove', onDragMove);
+    window.addEventListener('touchmove', onDragMove, { passive: false });
+    window.addEventListener('mouseup', onDragEnd);
+    window.addEventListener('touchend', onDragEnd);
+  }
+
+  function onDragMove(e) {
+    if (!cropState.dragging && !cropState.resizing) return;
+    e.preventDefault();
+
+    const coords = getEventCoords(e);
+    const deltaX = coords.x - cropState.startX;
+    const deltaY = coords.y - cropState.startY;
+
+    let newX = cropState.startBoxX, newY = cropState.startBoxY, newW = cropState.startBoxW, newH = cropState.startBoxH;
+
+    if (cropState.dragging) {
+      newX += deltaX;
+      newY += deltaY;
+    } else if (cropState.resizing) {
+      const handle = cropState.activeHandle;
+      if (handle.includes('e')) { newW += deltaX; }
+      if (handle.includes('w')) { newW -= deltaX; newX += deltaX; }
+      if (handle.includes('s')) { newH += deltaY; }
+      if (handle.includes('n')) { newH -= deltaY; newY += deltaY; }
+    }
+
+    const minSize = 20;
+    if (newW < minSize) { newW = minSize; }
+    if (newH < minSize) { newH = minSize; }
+
+    const imgRight = cropState.imgDisplayX + cropState.imgDisplayWidth;
+    const imgBottom = cropState.imgDisplayY + cropState.imgDisplayHeight;
+
+    if (newX < cropState.imgDisplayX) { newX = cropState.imgDisplayX; }
+    if (newY < cropState.imgDisplayY) { newY = cropState.imgDisplayY; }
+    if (newX + newW > imgRight) { newW = imgRight - newX; }
+    if (newY + newH > imgBottom) { newH = imgBottom - newY; }
+
+    cropState.cropBoxX = newX;
+    cropState.cropBoxY = newY;
+    cropState.cropBoxW = newW;
+    cropState.cropBoxH = newH;
+
+    updateCropBoxView();
+    updatePreview();
+  }
+
+  function onDragEnd() {
+    cropState.dragging = false;
+    cropState.resizing = false;
+    cropState.activeHandle = null;
+    window.removeEventListener('mousemove', onDragMove);
+    window.removeEventListener('touchmove', onDragMove);
+    window.removeEventListener('mouseup', onDragEnd);
+    window.removeEventListener('touchend', onDragEnd);
+  }
+
+  viewport.addEventListener('mousedown', onDragStart);
+  viewport.addEventListener('touchstart', onDragStart, { passive: false });
+})();
+
+function cancelCrop() {
+  // Reset crop state if needed, though it's re-initialized on open
+  document.getElementById('cropModal').classList.add('hidden');
+  // Revoke any temporary object URL to free memory
+  if (rawPhotoObjectUrl) { try { URL.revokeObjectURL(rawPhotoObjectUrl); } catch (e) {} rawPhotoObjectUrl = null; }
+}
+
+function updatePreview() {
+  const { cropBoxX, cropBoxY, cropBoxW, cropBoxH, img, scaleRatio, imgDisplayX, imgDisplayY } = cropState;
+
+  const relativeX = cropBoxX - imgDisplayX;
+  const relativeY = cropBoxY - imgDisplayY;
+
+  const srcX = relativeX * scaleRatio;
+  const srcY = relativeY * scaleRatio;
+  const srcW = Math.max(1, Math.round(cropBoxW * scaleRatio));
+  const srcH = Math.max(1, Math.round(cropBoxH * scaleRatio));
+
+  const canvas = document.createElement('canvas');
+  canvas.width = srcW;
+  canvas.height = srcH;
+  const ctx = canvas.getContext('2d');
+
+  try {
+    ctx.drawImage(img, Math.round(srcX), Math.round(srcY), srcW, srcH, 0, 0, srcW, srcH);
+  } catch (e) {
+    console.error('drawImage failed', e);
+    showToast('Erreur lors du recadrage de l\'image', 'error');
+    return;
+  }
+
+  const dataURL = canvas.toDataURL('image/jpeg', 0.9);
+
+  if (cropState.source === 'register') {
+    const preview = document.getElementById('previewImg');
+    preview.src = dataURL;
+    preview.classList.remove('hidden');
+    document.getElementById('photoPlaceholder').classList.add('hidden');
+  } else if (cropState.source === 'settings') {
+    document.getElementById('settingsAvatar').src = dataURL;
+  }
+}
+
+function applyCrop() {
+  updatePreview();
+  croppedPhotoData = document.getElementById('previewImg').src;
+  // free the temporary object URL if any
+  if (rawPhotoObjectUrl) { try { URL.revokeObjectURL(rawPhotoObjectUrl); } catch (e) {} rawPhotoObjectUrl = null; }
+  if (cropState.source === 'settings') {
+    var newAvatar = document.getElementById('settingsAvatar').src;
+    currentUser.avatar = newAvatar;
+    var idx = DB.membres.findIndex(function(u) { return u.id === currentUser.id; });
+    if (idx !== -1) updateUser(currentUser);
+
+    // refresh all profiles/avatar displays immediately
+    document.getElementById('topBarAvatar').src = newAvatar;
+    document.getElementById('sidebarAvatar').src = newAvatar;
+    document.getElementById('settingsAvatar').src = newAvatar;
+    renderMembers();
+    renderCotisations('all');
+
+    showToast('Photo de profil mise à jour !', 'success');
+  }
+  cancelCrop();
+}
+
+/* ===========================================================
+   REGISTRATION
+   =========================================================== */
+async function handleRegister() {
+  var nom = document.getElementById('regNom').value.trim();
+  var prenom = document.getElementById('regPrenom').value.trim();
+  var phone = getPhone('regPhone');
+  var pin = getPin('reg');
+
+  // Validation du nom
+  if (isRegistering) return; // protect from double click
+  isRegistering = true;
+
+  if (!nom) { 
+    showToast('Nom manquant - Veuillez entrer votre nom', 'error'); 
+    document.getElementById('regNom').focus();
+    isRegistering = false;
+    return; 
+  }
+  
+  // Validation du prénom
+  if (!prenom) { 
+    showToast('Prénom manquant - Veuillez entrer votre prénom', 'error'); 
+    document.getElementById('regPrenom').focus();
+    isRegistering = false;
+    return; 
+  }
+  
+  // Validation du numéro de téléphone
+  var cleanPhone = phone.replace(/ /g, '');
+  if (!cleanPhone) { 
+    showToast('Numéro de téléphone manquant - Veuillez entrer votre numéro', 'error'); 
+    document.getElementById('regPhone1').focus();
+    return; 
+  }
+  if (cleanPhone.length !== 8) { 
+    showToast('Numéro de téléphone incorrect - Le numéro doit contenir exactement 8 chiffres', 'error'); 
+    document.getElementById('regPhone1').focus();
+    return; 
+  }
+  if (!/^\d{8}$/.test(cleanPhone)) { 
+    showToast('Numéro de téléphone invalide - Utilisez uniquement des chiffres', 'error'); 
+    document.getElementById('regPhone1').focus();
+    return; 
+  }
+  
+  // Validation du mot de passe
+  if (!pin) { 
+    showToast('Mot de passe manquant - Veuillez entrer un code PIN', 'error'); 
+    // Focus on first PIN input
+    var firstRegPin = document.querySelector('[data-pin="reg"][data-index="0"]'); if (firstRegPin) firstRegPin.focus();
+    return; 
+  }
+  if (pin.length !== 4) { 
+    showToast('Mot de passe incorrect - Le code PIN doit contenir exactement 4 chiffres', 'error'); 
+    // Focus on first PIN input
+    var firstRegPin2 = document.querySelector('[data-pin="reg"][data-index="0"]'); if (firstRegPin2) firstRegPin2.focus();
+    return; 
+  }
+  if (!/^\d{4}$/.test(pin)) { 
+    showToast('Mot de passe invalide - Le code PIN ne peut contenir que des chiffres', 'error'); 
+    // Focus on first PIN input
+    var firstRegPin3 = document.querySelector('[data-pin="reg"][data-index="0"]'); if (firstRegPin3) firstRegPin3.focus();
+    return; 
+  }
+
+  // Validation du code administrateur
+  if (selectedRole === 'admin') {
+    var code = document.getElementById('adminCode').value.trim();
+    if (!code) { 
+      showToast('Code administrateur manquant - Veuillez entrer le code', 'error'); 
+      document.getElementById('adminCode').focus();
+      return; 
+    }
+    if (code !== '1958') { 
+      showToast('Code administrateur incorrect - Vérifiez le code saisi', 'error'); 
+      document.getElementById('adminCode').focus();
+      return; 
+    }
+  }
+
+  // Vérification si le numéro existe déjà (même si pré-créé par admin)
+  var existing = DB.membres.find(function(u) { return u.phone === phone; });
+  if (existing) {
+    showToast('Ce numéro possède déjà un compte.', 'error');
+    document.getElementById('regPhone1').focus();
+    isRegistering = false;
+    return;
+  }
+
+  var defaultAvatar = generateDefaultAvatar(prenom);
+
+  // Local registration (no remote auth)
+  try {
+    var user = {
+      id: Date.now().toString(),
+      nom: nom,
+      prenom: prenom,
+      phone: phone,
+      pin: pin,
+      role: selectedRole,
+      avatar: croppedPhotoData || defaultAvatar,
+      created_at: new Date().toISOString()
+    };
+
+    var result = await insertUser(user);
+    croppedPhotoData = null;
+    currentUser = user;
+    initDashboard();
+    if (result.error) {
+      showToast('Inscription enregistrée localement (mode hors ligne).', 'warning');
+    } else {
+      showToast('Inscription réussie et connecté !', 'success');
+    }
+    showScreen('dashboardScreen');
+    isRegistering = false;
+  } catch (err) {
+    console.error('signup flow error', err);
+    showToast('Erreur lors de l\'inscription', 'error');
+    isRegistering = false;
+  }
+}
+
+function generateDefaultAvatar(name) {
+  var canvas = document.createElement('canvas');
+  canvas.width = 200;
+  canvas.height = 200;
+  var ctx = canvas.getContext('2d');
+  var colors = ['#C0621A', '#D4A843', '#8B3E0A', '#27AE60', '#2980B9', '#8E44AD'];
+  var color = colors[(name || 'U').charCodeAt(0) % colors.length];
+  ctx.fillStyle = color;
+  ctx.fillRect(0, 0, 200, 200);
+  ctx.fillStyle = '#FFFFFF';
+  ctx.font = 'bold 80px Nunito, sans-serif';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText((name || 'U').charAt(0).toUpperCase(), 100, 100);
+  return canvas.toDataURL();
+}
+
+function getFirstName(fullName) {
+  if (!fullName) return '';
+  return fullName.toString().trim().split(' ')[0] || '';
+}
+
+var isRegistering = false;
+
+function syncCurrentUserAvatar(avatar) {
+  if (!avatar) return;
+  if (currentUser) currentUser.avatar = avatar;
+  var topBarAvatar = document.getElementById('topBarAvatar');
+  var sidebarAvatar = document.getElementById('sidebarAvatar');
+  var settingsAvatar = document.getElementById('settingsAvatar');
+  if (topBarAvatar) topBarAvatar.src = avatar;
+  if (sidebarAvatar) sidebarAvatar.src = avatar;
+  if (settingsAvatar) settingsAvatar.src = avatar;
+  renderMembers();
+  renderCotisations('all');
+}
+
+function getMemberAvatar(user) {
+  var firstName = getFirstName(user.prenom || user.nom || 'U');
+  return user.avatar ? user.avatar : generateDefaultAvatar(firstName);
+}
+
+/* ===========================================================
+   LOGIN
+   =========================================================== */
+function handleLogin() {
+  if (isLoggingIn) { showToast('Connexion en cours...', 'info'); return; }
+  isLoggingIn = true;
+
+  function cleanup() {
+    isLoggingIn = false;
+  }
+
+  var phone = getPhone('loginPhone');
+  var pin = getPin('login');
+
+  // Validation du numéro de téléphone
+  var cleanPhone = phone.replace(/ /g, '');
+  if (cleanPhone.length !== 8) { 
+    showToast('Numéro de téléphone incorrect - Le numéro doit contenir 8 chiffres', 'error'); 
+    document.getElementById('loginPhone1').focus();
+    cleanup();
+    return; 
+  }
+  
+  // Validation du mot de passe
+  if (pin.length !== 4) { 
+    showToast('Mot de passe incorrect - Le code PIN doit contenir 4 chiffres', 'error'); 
+    // Focus on first PIN input
+    var firstLoginPin = document.querySelector('[data-pin="login"][data-index="0"]'); if (firstLoginPin) firstLoginPin.focus();
+    cleanup();
+    return; 
+  }
+
+  // Local login (search in-memory DB)
+  try {
+    var user = DB.membres.find(function(u){ return u.phone === phone && u.pin === pin; });
+    if (!user) { showToast('Numéro ou mot de passe incorrect', 'error'); cleanup(); return; }
+    currentUser = user;
+    initDashboard();
+    showScreen('dashboardScreen');
+    cleanup();
+  } catch (err) {
+    console.error('local signin error', err);
+    showToast('Erreur lors de la connexion', 'error');
+    cleanup();
+  }
+}
+
+function handleLoginEnter(e) {
+  if (e.key === 'Enter' && !document.getElementById('loginScreen').classList.contains('hidden')) {
+    e.preventDefault();
+    handleLogin();
+  }
+}
+
+function handleRegisterEnter(e) {
+  if (e.key === 'Enter' && !document.getElementById('registerScreen').classList.contains('hidden')) {
+    e.preventDefault();
+    handleRegister();
+  }
+}
+
+function handleLogout() {
+  if (isLoggingOut) { showToast('Déconnexion en cours...', 'info'); return; }
+  isLoggingOut = true;
+
+  function cleanup() {
+    isLoggingOut = false;
+  }
+
+  showConfirmDialog('Voulez-vous vous déconnecter ?', function() {
+    currentUser = null;
+    showScreen('loginScreen');
+    toggleSidebar();
+    cleanup();
+  });
+}
+
+/* ===========================================================
+   DASHBOARD INIT
+   =========================================================== */
+function initDashboard() {
+  if (!currentUser) return;
+  document.getElementById('topBarAvatar').src = currentUser.avatar;
+  document.getElementById('topBarName').textContent = currentUser.prenom;
+  document.getElementById('sidebarAvatar').src = currentUser.avatar;
+  document.getElementById('sidebarName').textContent = currentUser.prenom;
+  document.getElementById('sidebarRole').textContent = currentUser.role === 'admin' ? 'Administrateur' : 'Membre';
+  document.getElementById('welcomeText').textContent = 'Bienvenue, ' + currentUser.prenom.split(' ')[0] + ' !';
+  document.getElementById('settingsAvatar').src = currentUser.avatar;
+  document.getElementById('settingsNom').value = currentUser.nom;
+  document.getElementById('settingsPrenom').value = currentUser.prenom;
+  setPhoneParts('settingsPhone', currentUser.phone);
+
+  syncThemeToggle();
+
+  // Show FAB only for admin on meetings page
+  updateFabVisibility();
+
+  renderHomeMeetings();
+  renderMeetings();
+  renderCotisations('all');
+  renderNotes();
+  updateAnnoncesBadge();
+}
+
+function updateFabVisibility() {
+  var fab = document.getElementById('fabBtn');
+  var activePage = document.querySelector('.page.active');
+  if (!activePage) { fab.classList.add('hidden'); return; }
+  var pageId = activePage.id;
+  if (currentUser && currentUser.role === 'admin' && (pageId === 'page-meetings' || pageId === 'page-home')) {
+    fab.classList.remove('hidden');
+    fab.onclick = openAddMeetingModal;
+  } else if (currentUser && currentUser.role === 'admin' && pageId === 'page-cotisations') {
+    fab.classList.remove('hidden');
+    fab.onclick = openAddCotisationModal;
+  } else {
+    fab.classList.add('hidden');
+  }
+}
+
+/* ===========================================================
+   SIDEBAR
+   =========================================================== */
+function toggleSidebar() {
+  document.getElementById('sidebar').classList.toggle('open');
+  document.getElementById('sidebarOverlay').classList.toggle('open');
+}
+
+/* ===========================================================
+   PAGE NAVIGATION
+   =========================================================== */
+function navigateTo(page) {
+  var pages = document.querySelectorAll('.page');
+  pages.forEach(function(p) { p.classList.remove('active'); });
+  var target = document.getElementById('page-' + page);
+  if (target) target.classList.add('active');
+
+  // Update sidebar active
+  document.querySelectorAll('.sidebar-item').forEach(function(item) {
+    item.classList.remove('active');
+    if (item.getAttribute('data-page') === page) item.classList.add('active');
+  });
+
+  updateFabVisibility();
+
+  // Close sidebar if open
+  if (document.getElementById('sidebar').classList.contains('open')) {
+    toggleSidebar();
+  }
+
+  // Refresh data after visible frame for instant UI response
+  window.requestAnimationFrame(function() {
+    if (page === 'cotisations') renderCotisations('all');
+    if (page === 'members') renderMembers();
+    if (page === 'annonces') {
+      (DB.annonces || []).forEach(function(a){ a.read = true; });
+      renderAnnonces();
+      updateAnnoncesBadge();
+    }
+    if (page === 'notes') renderNotes();
+    if (page === 'settings') {
+      document.getElementById('settingsAvatar').src = currentUser.avatar;
+      document.getElementById('settingsNom').value = currentUser.nom;
+      document.getElementById('settingsPrenom').value = currentUser.prenom;
+      setPhoneParts('settingsPhone', currentUser.phone);
+    }
+  });
+}
+
+/* ===========================================================
+   MEETINGS
+   =========================================================== */
+function renderMeetings() {
+  var container = document.getElementById('meetingsList');
+  var emptyEl = document.getElementById('meetingsEmpty');
+  container.innerHTML = '';
+  var sorted = DB.meetings.slice().sort(function(a, b) { return new Date(b.date) - new Date(a.date); });
+
+  if (sorted.length === 0) {
+    emptyEl.classList.remove('hidden');
+    return;
+  }
+  emptyEl.classList.add('hidden');
+
+  sorted.forEach(function(m) {
+    var card = createMeetingCard(m);
+    container.appendChild(card);
+  });
+}
+
+function renderHomeMeetings() {
+  var container = document.getElementById('homeMeetingsList');
+  var emptyEl = document.getElementById('homeEmpty');
+  container.innerHTML = '';
+  var now = new Date();
+  var upcoming = DB.meetings.filter(function(m) { return new Date(m.date) >= new Date(now.toDateString()); });
+  upcoming.sort(function(a, b) { return new Date(a.date) - new Date(b.date); });
+  var toShow = upcoming.slice(0, 3);
+
+  if (DB.meetings.length === 0) {
+    emptyEl.classList.remove('hidden');
+    return;
+  }
+  emptyEl.classList.add('hidden');
+
+  if (toShow.length === 0) {
+    // Show latest past meetings
+    var past = DB.meetings.slice().sort(function(a, b) { return new Date(b.date) - new Date(a.date); });
+    toShow = past.slice(0, 3);
+  }
+
+  toShow.forEach(function(m) {
+    container.appendChild(createMeetingCard(m));
+  });
+}
+
+function createMeetingCard(m) {
+  var now = new Date();
+  var mDate = new Date(m.date);
+  var isPast = mDate < new Date(now.toDateString());
+  var card = document.createElement('div');
+  card.className = 'meeting-card';
+  card.onclick = function() { showMeetingDetail(m.id); };
+
+  var titlesHtml = m.titles.map(function(t, i) {
+    if (i === 0) return '<h4>' + escapeHtml(t) + '</h4>';
+    return '<div class="sub-title">' + escapeHtml(t) + '</div>';
+  }).join('');
+
+  card.innerHTML =
+    '<div class="meeting-card-header">' +
+      '<span class="meeting-date-badge">' + formatDate(m.date) + '</span>' +
+      '<span class="meeting-status ' + (isPast ? 'done' : 'upcoming') + '">' + (isPast ? 'Terminée' : 'À venir') + '</span>' +
+    '</div>' +
+    '<div class="meeting-titles">' + titlesHtml + '</div>' +
+    '<div class="meeting-location"><i class="fas fa-map-marker-alt"></i> ' + escapeHtml(m.lieu) + '</div>';
+  return card;
+}
+
+function showMeetingDetail(id) {
+  var m = DB.meetings.find(function(mt) { return mt.id === id; });
+  if (!m) return;
+
+  var container = document.getElementById('meetingDetailContent');
+  var titlesHtml = m.titles.map(function(t, i) {
+    return '<div class="meeting-title-item"><span class="meeting-title-number">' + (i + 1) + '.</span> ' + escapeHtml(t) + '</div>';
+  }).join('');
+
+  container.innerHTML =
+    '<div class="meeting-detail-header">' +
+      '<h3>Réunion du ' + formatDate(m.date) + '</h3>' +
+      '<div class="meeting-detail-info">' +
+        '<span><i class="fas fa-calendar"></i> ' + formatDate(m.date) + '</span>' +
+        '<span><i class="fas fa-map-marker-alt"></i> ' + escapeHtml(m.lieu) + '</span>' +
+        '<div class="meeting-object-label"><i class="fas fa-list"></i> Objet de la réunion</div>' +
+        '<div class="meeting-titles-detail">' + titlesHtml + '</div>' +
+      '</div>' +
+    '</div>';
+
+  if (currentUser.role === 'admin') {
+    container.innerHTML +=
+      '<div style="display:flex;gap:8px;margin-bottom:20px">' +
+        '<button class="btn btn-secondary btn-small" onclick="editMeeting(\'' + m.id + '\')"><i class="fas fa-edit"></i> Modifier</button>' +
+        '<button class="btn btn-danger btn-small" onclick="deleteMeeting(\'' + m.id + '\')"><i class="fas fa-trash"></i> Supprimer</button>' +
+      '</div>';
+  }
+
+  // Member note areas - one for each meeting title
+  var notesHtml = '<div class="section-title"><i class="fas fa-pen"></i> Notes de réunion</div>';
+  
+  m.titles.forEach(function(title, index) {
+    var noteForTitle = DB.notes.find(function(n) { 
+      return n.meetingId === m.id && n.userId === currentUser.id && n.titleIndex === index; 
+    });
+    
+    notesHtml += 
+      '<div class="meeting-note-section">' +
+        '<div class="meeting-note-title">' + (index + 1) + '. ' + escapeHtml(title) + '</div>' +
+        '<textarea class="note-textarea" id="meetingNoteArea_' + index + '" placeholder="Notes pour ce point...">' + (noteForTitle ? escapeHtml(noteForTitle.content) : '') + '</textarea>' +
+      '</div>';
+  });
+  
+  notesHtml += '<button class="btn btn-primary" style="margin-top:12px" onclick="saveMeetingNotes(\'' + m.id + '\', ' + m.titles.length + ')"><i class="fas fa-save"></i> Sauvegarder toutes les notes</button>';
+  
+  container.innerHTML += notesHtml;
+
+  navigateTo('meetingDetail');
+}
+
+function saveMeetingNotes(meetingId, titlesCount) {
+  for (var i = 0; i < titlesCount; i++) {
+    var content = document.getElementById('meetingNoteArea_' + i).value;
+    var existing = DB.notes.find(function(n) { 
+      return n.meetingId === meetingId && n.userId === currentUser.id && n.titleIndex === i; 
+    });
+    
+    if (existing) {
+      if (content.trim()) {
+        existing.content = content;
+        existing.updatedAt = new Date().toISOString();
+      } else {
+        // Remove empty notes
+        var index = DB.notes.indexOf(existing);
+        if (index > -1) DB.notes.splice(index, 1);
+      }
+    } else if (content.trim()) {
+      // Create new note only if content is not empty
+      var noteObj = {
+        id: Date.now().toString() + '_' + i,
+        meetingId: meetingId,
+        userId: currentUser.id,
+        titleIndex: i,
+        content: content,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString()
+      };
+      insertNote(noteObj);
+    }
+  }
+  showToast('Notes sauvegardées !', 'success');
+}
+
+/* ADD MEETING MODAL */
+function openAddMeetingModal() {
+  document.getElementById('meetingModal').classList.add('open');
+  document.getElementById('meetingDate').value = new Date().toISOString().split('T')[0];
+  document.getElementById('titleFields').innerHTML =
+    '<div class="form-group"><label>Titre 1</label><input type="text" class="form-input meeting-title-input" placeholder="Titre de la réunion"></div>';
+  document.getElementById('meetingLieu').value = '';
+}
+
+function closeMeetingModal() {
+  document.getElementById('meetingModal').classList.remove('open');
+}
+
+function addTitleField() {
+  var container = document.getElementById('titleFields');
+  var count = container.querySelectorAll('.meeting-title-input').length + 1;
+  var div = document.createElement('div');
+  div.className = 'form-group';
+  div.innerHTML = '<label>Titre ' + count + '</label><input type="text" class="form-input meeting-title-input" placeholder="Titre supplémentaire">';
+  container.appendChild(div);
+}
+
+function saveMeeting() {
+  if (isSavingMeeting) { showToast('Enregistrement en cours...', 'info'); return; }
+  isSavingMeeting = true;
+
+  function cleanup() {
+    isSavingMeeting = false;
+  }
+
+  var date = document.getElementById('meetingDate').value;
+  var lieu = document.getElementById('meetingLieu').value.trim();
+  var titleInputs = document.querySelectorAll('.meeting-title-input');
+  var titles = [];
+  titleInputs.forEach(function(inp) {
+    if (inp.value.trim()) titles.push(inp.value.trim());
+  });
+
+  if (!date) { showToast('Date manquante - Veuillez choisir une date pour la réunion', 'error'); cleanup(); return; }
+  if (titles.length === 0) { showToast('Titre manquant - Ajoutez au moins un titre à la réunion', 'error'); cleanup(); return; }
+  if (!lieu) { showToast('Lieu manquant - Indiquez le lieu de la réunion', 'error'); cleanup(); return; }
+
+  var meetingObj = {
+    id: Date.now().toString(),
+    date: date,
+    titles: titles,
+    lieu: lieu,
+    createdBy: currentUser.id,
+    createdAt: new Date().toISOString()
+  };
+  insertMeeting(meetingObj);
+
+  closeMeetingModal();
+  renderMeetings();
+  renderHomeMeetings();
+  showToast('Réunion ajoutée !');
+  cleanup();
+}
+
+function editMeeting(id) {
+  var m = DB.meetings.find(function(mt) { return mt.id === id; });
+  if (!m) return;
+  openAddMeetingModal();
+  document.getElementById('meetingDate').value = m.date;
+  document.getElementById('meetingLieu').value = m.lieu;
+  var container = document.getElementById('titleFields');
+  container.innerHTML = '';
+  m.titles.forEach(function(t, i) {
+    var div = document.createElement('div');
+    div.className = 'form-group';
+    div.innerHTML = '<label>Titre ' + (i + 1) + '</label><input type="text" class="form-input meeting-title-input" value="' + escapeHtml(t) + '">';
+    container.appendChild(div);
+  });
+
+  // Remove old meeting remotely (and locally) — will re-save
+  deleteMeetingData(id);
+}
+
+function deleteMeeting(id) {
+  showConfirmDialog('Supprimer cette réunion ?', function() {
+    deleteMeetingData(id).then(function(){
+      navigateTo('meetings');
+      showToast('Réunion supprimée');
+    });
+  });
+}
+
+/* ===========================================================
+   COTISATIONS
+   =========================================================== */
+function openAddCotisationModal(memberId) {
+  var select = document.getElementById('cotisationMember');
+  select.innerHTML = '';
+
+  // If a memberId is provided and the current user is not admin, ensure they can only open for themselves
+  if (memberId && currentUser.role !== 'admin' && memberId !== currentUser.id) {
+    showToast('Vous ne pouvez pas remplir la cotisation d\u00e9un autre membre.', 'error');
+    return;
+  }
+
+  if (currentUser.role === 'admin') {
+    // Admin can select all members; if memberId given, preselect it
+    DB.membres.forEach(function(u) {
+      var opt = document.createElement('option');
+      opt.value = u.id;
+      opt.textContent = u.nom + ' ' + u.prenom;
+      if (memberId && memberId === u.id) opt.selected = true;
+      select.appendChild(opt);
+    });
+  } else {
+    // Regular members can only select themselves
+    var opt = document.createElement('option');
+    opt.value = currentUser.id;
+    opt.textContent = currentUser.nom + ' ' + currentUser.prenom;
+    select.appendChild(opt);
+  }
+
+  document.getElementById('cotisationAmount').value = '';
+  document.getElementById('cotisationDesc').value = '';
+  var modal = document.getElementById('cotisationModal');
+
+  // If opened for a specific member, hide the member selector and description and change title
+  var memberGroup = select.parentElement; // the form-group containing the select
+  var descInput = document.getElementById('cotisationDesc');
+  var descGroup = descInput.parentElement;
+  var titleEl = modal.querySelector('.modal-title');
+
+  if (memberId) {
+    select.value = memberId;
+    memberGroup.style.display = 'none';
+    descGroup.style.display = 'none';
+    modal.dataset.forMember = memberId;
+    var member = DB.membres.find(function(u){ return u.id === memberId; });
+    titleEl.textContent = member ? ('Cotisation — ' + member.nom + ' ' + member.prenom) : 'Cotisation';
+  } else {
+    memberGroup.style.display = '';
+    descGroup.style.display = '';
+    delete modal.dataset.forMember;
+    titleEl.textContent = 'Ajouter une cotisation';
+  }
+
+  // Afficher l'info de cotisation existante pour le membre sélectionné
+  updateExistingCotisationInfo(memberId || select.value);
+
+  modal.classList.add('open');
+}
+
+/* Met à jour l'indicateur de cotisation existante dans le modal */
+function updateExistingCotisationInfo(memberId) {
+  var infoBox = document.getElementById('existingCotisationInfo');
+  var infoText = document.getElementById('existingCotisationText');
+  var saveBtn = document.getElementById('cotisationSaveBtn');
+  var amountLabel = document.getElementById('cotisationAmountLabel');
+
+  if (!memberId) { infoBox.classList.add('hidden'); return; }
+
+  var now = new Date();
+  var currentMonth = now.getMonth();
+  var currentYear = now.getFullYear();
+  var monthNames = ['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'];
+
+  // Trouver les cotisations existantes de ce membre pour le mois courant
+  var existing = DB.cotisations.filter(function(c) {
+    return c.memberId === memberId && c.month === currentMonth && c.year === currentYear;
+  });
+  var existingTotal = existing.reduce(function(s, c) { return s + c.amount; }, 0);
+
+  if (existingTotal > 0) {
+    infoBox.classList.remove('hidden');
+    infoText.innerHTML = 'Cotisation actuelle pour <strong>' + monthNames[currentMonth] + ' ' + currentYear + '</strong> : <strong style="color:var(--accent)">' + formatMoney(existingTotal) + '</strong><br>' +
+      '<span style="font-size:12px;opacity:0.8;">Le nouveau montant <strong>remplacera</strong> l\'ancien. Laisser vide ou mettre 0 pour <strong>retirer</strong> la cotisation.</span>';
+    amountLabel.textContent = 'Nouveau montant (FCFA)';
+    saveBtn.innerHTML = '<i class="fas fa-exchange-alt"></i> Remplacer';
+  } else {
+    infoBox.classList.add('hidden');
+    amountLabel.textContent = 'Montant (FCFA)';
+    saveBtn.innerHTML = '<i class="fas fa-check"></i> Enregistrer';
+  }
+}
+
+/* Appelé quand l'admin change le membre dans le select */
+function onCotisationMemberChange() {
+  var memberId = document.getElementById('cotisationMember').value;
+  document.getElementById('cotisationAmount').value = '';
+  updateExistingCotisationInfo(memberId);
+}
+
+function closeCotisationModal() {
+  var modal = document.getElementById('cotisationModal');
+  // restore hidden groups if we previously hid them
+  var select = document.getElementById('cotisationMember');
+  var memberGroup = select.parentElement;
+  var descInput = document.getElementById('cotisationDesc');
+  var descGroup = descInput.parentElement;
+  var titleEl = modal.querySelector('.modal-title');
+
+  memberGroup.style.display = '';
+  descGroup.style.display = '';
+  titleEl.textContent = 'Ajouter une cotisation';
+  delete modal.dataset.forMember;
+  modal.classList.remove('open');
+}
+
+async function saveCotisation() {
+  if (isSavingCotisation) { showToast('Enregistrement en cours...', 'info'); return; }
+  isSavingCotisation = true;
+  var saveBtn = document.getElementById('cotisationSaveBtn');
+  if (saveBtn) saveBtn.disabled = true;
+
+  function cleanup() {
+    isSavingCotisation = false;
+    if (saveBtn) saveBtn.disabled = false;
+  }
+
+  var memberId = document.getElementById('cotisationMember').value;
+  var rawAmount = document.getElementById('cotisationAmount').value;
+  var amount = rawAmount === '' ? null : parseInt(rawAmount);
+  var desc = document.getElementById('cotisationDesc').value.trim();
+
+  if (!memberId) { showToast('Sélectionnez un membre', 'error'); return; }
+
+  // Permission guard: non-admins can only add cotisation for themselves
+  if (currentUser.role !== 'admin' && memberId !== currentUser.id) {
+    showToast('Vous n\u2019\u00eates pas autorisé à remplir la cotisation d\u2019un autre membre.', 'error');
+    return;
+  }
+
+  var now = new Date();
+  var currentMonth = now.getMonth();
+  var currentYear = now.getFullYear();
+
+  // Trouver les cotisations existantes de ce membre pour le mois en cours
+  var existingCots = DB.cotisations.filter(function(c) {
+    return c.memberId === memberId && c.month === currentMonth && c.year === currentYear;
+  });
+
+  // CAS 1 : montant vide ou 0 → le membre ne cotise plus ce mois → supprimer les existantes
+  if (amount === null || amount === 0) {
+    if (existingCots.length === 0) {
+      showToast('Aucune cotisation à retirer pour ce mois.', 'error');
+      return;
+    }
+    // Supprimer toutes les cotisations du mois pour ce membre
+    deleteCotisationsOfMonth(memberId, currentMonth, currentYear).then(function() {
+      closeCotisationModal();
+      renderCotisations('all');
+      showToast('Cotisation retirée pour ce mois.', 'success');
+    });
+    return;
+  }
+
+  // Validation montant positif
+  if (amount <= 0 || isNaN(amount)) {
+    showToast('Montant invalide', 'error');
+    return;
+  }
+
+  // CAS 2 : il existe déjà une cotisation ce mois → supprimer l'ancienne puis insérer la nouvelle
+  var doInsert = function() {
+    var cotObj = {
+      id: Date.now().toString(),
+      memberId: memberId,
+      meetingId: null,
+      amount: amount,
+      description: desc || 'Cotisation',
+      date: now.toISOString(),
+      month: currentMonth,
+      year: currentYear,
+      day: now.getDate(),
+      time: now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+    };
+    insertCotisation(cotObj).then(function() {
+      closeCotisationModal();
+      renderCotisations('all');
+      showToast('Cotisation enregistrée !', 'success');
+    });
+  };
+
+  if (existingCots.length > 0) {
+    // Remplacer : supprimer l'ancienne puis insérer la nouvelle
+    deleteCotisationsOfMonth(memberId, currentMonth, currentYear).then(doInsert);
+  } else {
+    // CAS 3 : aucune cotisation ce mois → simple insertion
+    doInsert();
+  }
+}
+
+// Re-déclaration pour éviter double envoi lors de clics répétés
+async function saveCotisation() {
+  if (isSavingCotisation) { showToast('Enregistrement en cours...', 'info'); return; }
+  isSavingCotisation = true;
+  var saveBtn = document.getElementById('cotisationSaveBtn');
+  if (saveBtn) saveBtn.disabled = true;
+
+  function cleanup() {
+    isSavingCotisation = false;
+    if (saveBtn) saveBtn.disabled = false;
+  }
+
+  var memberId = document.getElementById('cotisationMember').value;
+  var rawAmount = document.getElementById('cotisationAmount').value;
+  var amount = rawAmount === '' ? null : parseInt(rawAmount);
+  var desc = document.getElementById('cotisationDesc').value.trim();
+
+  if (!memberId) { cleanup(); showToast('Sélectionnez un membre', 'error'); return; }
+  if (currentUser.role !== 'admin' && memberId !== currentUser.id) { cleanup(); showToast('Vous n\'êtes pas autorisé à remplir la cotisation d\'un autre membre.', 'error'); return; }
+
+  try {
+    var now = new Date();
+    var currentMonth = now.getMonth();
+    var currentYear = now.getFullYear();
+
+    var existingCots = DB.cotisations.filter(function(c) {
+      return c.memberId === memberId && c.month === currentMonth && c.year === currentYear;
+    });
+
+    if (amount === null || amount === 0) {
+      if (existingCots.length === 0) {
+        showToast('Aucune cotisation à retirer pour ce mois.', 'error');
+        return;
+      }
+      await deleteCotisationsOfMonth(memberId, currentMonth, currentYear);
+      closeCotisationModal();
+      renderCotisations('all');
+      showToast('Cotisation retirée pour ce mois.', 'success');
+      return;
+    }
+
+    if (amount <= 0 || isNaN(amount)) {
+      showToast('Montant invalide', 'error');
+      return;
+    }
+
+    var cotObj = {
+      id: Date.now().toString(),
+      memberId: memberId,
+      meetingId: null,
+      amount: amount,
+      description: desc || 'Cotisation',
+      date: now.toISOString(),
+      month: currentMonth,
+      year: currentYear,
+      day: now.getDate(),
+      time: now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+    };
+
+    if (existingCots.length > 0) {
+      await deleteCotisationsOfMonth(memberId, currentMonth, currentYear);
+    }
+
+    await insertCotisation(cotObj);
+    closeCotisationModal();
+    renderCotisations('all');
+    showToast('Cotisation enregistrée !', 'success');
+  } catch (err) {
+    console.error('saveCotisation error', err);
+    showToast('Erreur lors de l\'enregistrement de la cotisation.', 'error');
+  } finally {
+    cleanup();
+  }
+}
+
+function renderMembers() {
+  var container = document.getElementById('membersList');
+  var emptyEl = document.getElementById('membersEmpty');
+  container.innerHTML = '';
+
+  if (DB.membres.length === 0) {
+    emptyEl.classList.remove('hidden');
+    var countEl0 = document.getElementById('membersCount');
+    if (countEl0) countEl0.textContent = '0 Membres';
+    return;
+  }
+  emptyEl.classList.add('hidden');
+  var countEl = document.getElementById('membersCount');
+  if (countEl) {
+    var cnt = DB.membres.length || 0;
+    countEl.textContent = cnt + (cnt === 1 ? ' Membre' : ' Membres');
+  }
+
+  var addBtn = document.getElementById('addMemberBtn');
+  if (addBtn) {
+    addBtn.style.display = (currentUser && currentUser.role === 'admin') ? 'inline-flex' : 'none';
+  }
+
+  DB.membres.forEach(function(user) {
+    var memberCard = document.createElement('div');
+    memberCard.className = 'member-card';
+    // Build avatar
+    var left = document.createElement('div');
+    left.style.display = 'flex';
+    left.style.alignItems = 'center';
+    left.style.gap = '16px';
+
+    var avatarWrap = document.createElement('div');
+    avatarWrap.className = 'member-avatar';
+    var img = document.createElement('img');
+    img.src = getMemberAvatar(user);
+    img.alt = 'Avatar';
+    img.onerror = function() { this.src = generateDefaultAvatar(getFirstName(user.prenom || user.nom || 'U')); };
+    avatarWrap.appendChild(img);
+
+    var info = document.createElement('div');
+    info.className = 'member-info';
+    var nameEl = document.createElement('div');
+    nameEl.className = 'member-name';
+    nameEl.textContent = user.nom + ' ' + user.prenom;
+    var roleEl = document.createElement('div');
+    roleEl.className = 'member-role';
+    roleEl.textContent = (user.role === 'admin' ? 'Administrateur' : 'Membre');
+    info.appendChild(nameEl);
+    info.appendChild(roleEl);
+
+    left.appendChild(avatarWrap);
+    left.appendChild(info);
+
+    var right = document.createElement('div');
+    var canEdit = currentUser && (currentUser.role === 'admin' || currentUser.id === user.id);
+    var actionBtn = document.createElement('button');
+    actionBtn.className = canEdit ? 'btn btn-primary btn-small' : 'btn btn-secondary btn-small';
+    if (!canEdit) actionBtn.disabled = true;
+    actionBtn.innerHTML = canEdit ? '<i class="fas fa-coins"></i> Cotisation' : '<i class="fas fa-lock"></i> Cotisation';
+    if (canEdit) actionBtn.onclick = function() { openAddCotisationModal(user.id); };
+    right.appendChild(actionBtn);
+
+    var row = document.createElement('div');
+    row.style.display = 'flex';
+    row.style.alignItems = 'center';
+    row.style.justifyContent = 'space-between';
+    row.style.width = '100%';
+    row.appendChild(left);
+    row.appendChild(right);
+
+    memberCard.appendChild(row);
+    container.appendChild(memberCard);
+  });
+}
+
+function renderCotisations(filter) {
+  var container = document.getElementById('cotisationsList');
+  var emptyEl = document.getElementById('cotisationsEmpty');
+  var monthFilterContainer = document.getElementById('monthFilterContainer');
+  var yearFilterContainer = document.getElementById('yearFilterContainer');
+  container.innerHTML = '';
+
+  var now = new Date();
+  var monthSelectEl = document.getElementById('monthFilter');
+  var uiSelectedMonth = monthSelectEl ? monthSelectEl.value : '';
+  var selectedMonth = null;
+  if (filter === 'monthly') selectedMonth = parseInt(uiSelectedMonth) || now.getMonth();
+  // for yearly: only set selectedMonth if user picked a month from the dropdown
+  if (filter === 'yearly' && uiSelectedMonth !== '') selectedMonth = parseInt(uiSelectedMonth);
+  var selectedYear = now.getFullYear();
+
+  var yearSelectEl = document.getElementById('yearFilter');
+  var uiSelectedYear = yearSelectEl ? yearSelectEl.value : '';
+  if (filter === 'yearly' && uiSelectedYear !== '') selectedYear = parseInt(uiSelectedYear);
+
+  // Show month filter only for monthly view; year filter only for yearly view
+  if (monthFilterContainer) monthFilterContainer.classList.toggle('hidden', filter !== 'monthly');
+  if (yearFilterContainer) yearFilterContainer.classList.toggle('hidden', filter !== 'yearly');
+  
+  // Populate month filter (only for monthly view)
+  if (filter === 'monthly') {
+    var monthSelect = document.getElementById('monthFilter');
+    var monthNames = ['Janvier', 'Février', 'Mars', 'Avril', 'Mai', 'Juin', 'Juillet', 'Août', 'Septembre', 'Octobre', 'Novembre', 'Décembre'];
+    monthSelect.innerHTML = '<option value="">Sélectionner un mois</option>';
+    for (var i = 0; i < 12; i++) {
+      var option = document.createElement('option');
+      option.value = i;
+      option.textContent = monthNames[i] + ' ' + selectedYear;
+      monthSelect.appendChild(option);
+    }
+    monthSelect.value = selectedMonth;
+  }
+
+  // Get all cotisations based on filter
+  var allCots = DB.cotisations.slice();
+  // Populate year filter for yearly view (after we have cotisation data)
+  if (filter === 'yearly') {
+    var yearSelect = document.getElementById('yearFilter');
+    // Generate year list starting at 2026 up to far future (current year + 100)
+    var years = [];
+    var startYear = 2026;
+    var endYear = now.getFullYear() + 100; // effectively 'infinite' for practical use
+    for (var y = endYear; y >= startYear; y--) years.push(y);
+    yearSelect.innerHTML = '<option value="">Sélectionner une année</option>';
+    years.forEach(function(y) { var o = document.createElement('option'); o.value = y; o.textContent = y; yearSelect.appendChild(o); });
+    yearSelect.value = selectedYear;
+  }
+  // Determine a report month (use UI selection when available, else current month)
+  var reportMonth = (monthSelectEl && monthSelectEl.value !== '') ? parseInt(monthSelectEl.value) : now.getMonth();
+  var monthCots = allCots.filter(function(c) { return c.month === reportMonth && c.year === selectedYear; });
+  var yearCots = allCots.filter(function(c) { return c.year === selectedYear; });
+  var monthTotal = monthCots.reduce(function(s, c) { return s + c.amount; }, 0);
+  var yearTotal = yearCots.reduce(function(s, c) { return s + c.amount; }, 0);
+  var totalAll = allCots.reduce(function(s, c) { return s + c.amount; }, 0);
+
+  document.getElementById('monthlyTotal').textContent = formatMoney(monthTotal);
+  document.getElementById('yearlyTotal').textContent = formatMoney(yearTotal);
+
+  // If yearly view, show only the yearly total (no per-user listing)
+  if (filter === 'yearly') {
+    container.innerHTML = '<div style="display:flex;justify-content:center;padding:24px;">' +
+      '<div class="summary-card" style="max-width:420px;text-align:center;">' +
+        '<div class="amount" style="font-size:28px;">' + formatMoney(yearTotal) + '</div>' +
+        '<div class="label">Total des cotisations pour l\'ann\u00e9e ' + selectedYear + '</div>' +
+      '</div>' +
+    '</div>';
+    // Only show report/share buttons in the "All" view per user request
+    var shareBtn = document.getElementById('shareButtons'); if (shareBtn) shareBtn.classList.add('hidden');
+    return;
+  }
+
+  // Group cotisations by member
+  var memberTotals = {};
+  var memberData = {};
+
+  DB.membres.forEach(function(u) {
+    memberData[u.id] = {
+      nom: u.nom,
+      prenom: u.prenom,
+      avatar: getMemberAvatar(u),
+      role: u.role === 'admin' ? 'Administrateur' : 'Membre',
+      total: 0
+    };
+    memberTotals[u.id] = {};
+  });
+
+  // Calculate totals by member and time period (ne pas inclure les retraits dans le total par membre)
+  if (filter === 'all') {
+    allCots.forEach(function(c) {
+      if (memberData[c.memberId] && c.amount > 0) {
+        memberData[c.memberId].total += c.amount;
+      }
+    });
+  } else if (filter === 'monthly') {
+    allCots.filter(function(c) { return c.month === selectedMonth && c.year === selectedYear; }).forEach(function(c) {
+      if (memberData[c.memberId] && c.amount > 0) {
+        memberData[c.memberId].total += c.amount;
+      }
+    });
+  } else if (filter === 'yearly') {
+    if (selectedMonth === null) {
+      // Yearly view without a selected month: do not expose per-user amounts
+      // leave member totals at 0 and rely on yearlyTotal header for totals
+    } else {
+      // Yearly view but a specific month chosen: show per-user totals for that mois
+      allCots.filter(function(c) { return c.month === selectedMonth && c.year === selectedYear; }).forEach(function(c) {
+        if (memberData[c.memberId] && c.amount > 0) {
+          memberData[c.memberId].total += c.amount;
+        }
+      });
+    }
+  }
+
+  // Filter members with cotisations for monthly view
+  var membersToDisplay = Object.keys(memberData).map(function(id) {
+    return { id: id, ...memberData[id] };
+  });
+
+  // For monthly view or yearly-with-month-selected show only members with totals
+  if (filter === 'monthly' || (filter === 'yearly' && selectedMonth !== null)) {
+    membersToDisplay = membersToDisplay.filter(function(m) { return m.total > 0; });
+  }
+
+  if (membersToDisplay.length === 0) {
+    emptyEl.classList.remove('hidden');
+    var sbEmpty = document.getElementById('shareButtons'); if (sbEmpty) sbEmpty.classList.add('hidden');
+    return;
+  }
+  emptyEl.classList.add('hidden');
+  // Only show report/share when viewing all cotisations (not monthly/yearly)
+  var sbVisible = document.getElementById('shareButtons'); if (sbVisible) {
+    if (filter === 'all') sbVisible.classList.remove('hidden'); else sbVisible.classList.add('hidden');
+  }
+
+  // Sort by name
+  membersToDisplay.sort(function(a, b) { return a.prenom.localeCompare(b.prenom); });
+
+  // Affiche l'entête pour le total
+  var header = document.createElement('div');
+  header.style.padding = '12px 0';
+  header.style.display = 'flex';
+  header.style.justifyContent = 'space-between';
+  header.style.alignItems = 'center';
+  var monthNames = ['Janvier','Février','Mars','Avril','Mai','Juin','Juillet','Août','Septembre','Octobre','Novembre','Décembre'];
+  if (filter === 'all') {
+    header.innerHTML = '<div style="font-weight:600;">Montant total — Toutes les cotisations' +
+      '<div style="font-size:12px;color:#6B5744;margin-top:6px;">' + (monthNames[reportMonth] || monthNames[now.getMonth()]) + ' ' + selectedYear + '</div>' +
+    '</div>' +
+    '<div style="text-align:right;">' +
+      '<div style="font-weight:700;color:#C0621A;">' + formatMoney(totalAll) + '</div>' +
+      '<div style="font-size:14px;color:#6B5744;margin-top:6px;">' + formatMoney(monthTotal) + ' ce mois</div>' +
+    '</div>';
+  } else {
+    header.innerHTML = '<div style="font-weight:600;">Montant total — ' + (monthNames[selectedMonth] || monthNames[now.getMonth()]) + ' ' + selectedYear + '</div>' +
+      '<div style="font-weight:700;color:#C0621A;">' + formatMoney(monthTotal) + '</div>';
+  }
+  container.appendChild(header);
+
+  membersToDisplay.forEach(function(member) {
+    var entry = document.createElement('div');
+    entry.className = 'cotisation-entry';
+    var amountHtml = '';
+    if (filter === 'yearly' && selectedMonth === null) {
+      amountHtml = '<div class="cotisation-amount">—</div>';
+    } else {
+      amountHtml = '<div class="cotisation-amount">' + formatMoney(member.total) + '</div>';
+    }
+
+    var firstName = getFirstName(member.prenom || member.nom || '');
+    entry.innerHTML =
+      '<div class="cotisation-entry-left">' +
+        '<img src="' + getMemberAvatar({ prenom: member.prenom, nom: member.nom, avatar: member.avatar }) + '" alt="" onerror="this.src = generateDefaultAvatar(\'' + firstName + '\')">' +
+        '<div>' +
+          '<div class="cotisation-member-name">' + escapeHtml(member.nom + ' ' + member.prenom) + '</div>' +
+          '<div class="cotisation-role">' + member.role + '</div>' +
+        '</div>' +
+      '</div>' + amountHtml;
+
+    container.appendChild(entry);
+  });
+}
+
+function updateAnnoncesBadge() {
+  var badge = document.getElementById('annoncesUnreadBadge');
+  if (!badge) return;
+  var unread = (DB.annonces || []).filter(function(a){ return !a.read; }).length;
+  if (unread > 0) {
+    badge.textContent = unread;
+    badge.classList.remove('hidden');
+  } else {
+    badge.classList.add('hidden');
+  }
+}
+
+function addAnnonce(title, body, author) {
+  DB.annonces.unshift({
+    id: Date.now().toString(),
+    title: title,
+    body: body,
+    author: author || (currentUser ? (currentUser.prenom + ' ' + currentUser.nom) : 'Système'),
+    date: new Date().toLocaleString('fr-FR'),
+    read: false,
+    userId: currentUser ? currentUser.id : null,
+    timestamp: Date.now()
+  });
+  updateAnnoncesBadge();
+  renderAnnonces();
+}
+
+function cleanOldAnnonces() {
+  const sevenDaysAgo = Date.now() - 7 * 24 * 60 * 60 * 1000;
+  DB.annonces = DB.annonces.filter(a => !a.timestamp || a.timestamp > sevenDaysAgo);
+}
+
+function renderAnnonces() {
+  cleanOldAnnonces();
+  updateAnnoncesBadge();
+  var container = document.getElementById('annoncesList');
+  var empty = document.getElementById('annoncesEmpty');
+  container.innerHTML = '';
+
+  // Show add button for admins
+  var addBtn = document.getElementById('addAnnonceBtn');
+  if (addBtn) {
+    addBtn.style.display = (currentUser && currentUser.role === 'admin') ? 'inline-flex' : 'none';
+  }
+
+  if (!DB.annonces || DB.annonces.length === 0) {
+    if (empty) empty.classList.remove('hidden');
+    return;
+  }
+  if (empty) empty.classList.add('hidden');
+
+  DB.annonces.forEach(function(item) {
+    var card = document.createElement('div');
+    card.className = 'note-card';
+    var deleteBtn = (currentUser && item.userId === currentUser.id) ? '<button class="btn btn-danger btn-small" onclick="deleteAnnonce(\'' + item.id + '\')" style="float:right;"><i class="fas fa-trash"></i></button>' : '';
+    card.innerHTML =
+      '<div class="note-header">' +
+        '<div class="note-header-content">' +
+          '<strong>' + escapeHtml(item.title) + '</strong><br>' +
+          '<small style="color:var(--text-muted);">' + escapeHtml(item.author) + ' - ' + escapeHtml(item.date) + '</small>' +
+          deleteBtn +
+        '</div>' +
+      '</div>' +
+      '<div class="note-body">' + escapeHtml(item.body) + '</div>';
+    container.appendChild(card);
+  });
+}
+
+function deleteAnnonce(id) {
+  if (!confirm('Êtes-vous sûr de vouloir supprimer cette annonce ?')) return;
+  DB.annonces = DB.annonces.filter(a => a.id !== id);
+  renderAnnonces();
+  updateAnnoncesBadge();
+}
+
+function openAddAnnonceModal() {
+  if (!currentUser || currentUser.role !== 'admin') { showToast('Seul un administrateur peut publier une annonce.', 'error'); return; }
+  document.getElementById('newAnnonceTitle').value = '';
+  document.getElementById('newAnnonceBody').value = '';
+  document.getElementById('addAnnonceModal').classList.add('open');
+}
+
+function closeAddAnnonceModal() {
+  document.getElementById('addAnnonceModal').classList.remove('open');
+}
+
+function saveAnnonce() {
+  if (isSavingAnnonce) { showToast('Publication en cours...', 'info'); return; }
+  isSavingAnnonce = true;
+
+  function cleanup() {
+    isSavingAnnonce = false;
+  }
+
+  var title = document.getElementById('newAnnonceTitle').value.trim();
+  var body = document.getElementById('newAnnonceBody').value.trim();
+  if (!title || !body) { showToast('Titre et message requis.', 'error'); cleanup(); return; }
+  addAnnonce(title, body);
+  closeAddAnnonceModal();
+  showToast('Annonce publiée.', 'success');
+  cleanup();
+}
+
+function updateMemberAdminField() {
+  var role = document.getElementById('newMemberRole').value;
+  var adminField = document.getElementById('adminCodeFieldMember');
+  if (role === 'admin') {
+    adminField.style.display = 'block';
+  } else {
+    adminField.style.display = 'none';
+  }
+}
+
+function openAddMemberModal() {
+  if (!currentUser || currentUser.role !== 'admin') { showToast('Seul un administrateur peut ajouter un membre.', 'error'); return; }
+  document.getElementById('newMemberPrenom').value = '';
+  document.getElementById('newMemberNom').value = '';
+  document.getElementById('newMemberPhone').value = '';
+  document.getElementById('newMemberPin').value = '';
+  document.getElementById('newMemberRole').value = 'membre';
+  document.getElementById('newMemberAdminCode').value = '';
+  document.getElementById('adminCodeFieldMember').style.display = 'none';
+  document.getElementById('addMemberModal').classList.add('open');
+}
+
+function closeAddMemberModal() {
+  document.getElementById('addMemberModal').classList.remove('open');
+}
+
+async function saveMember() {
+  if (isSavingMember) { showToast('Enregistrement en cours...', 'info'); return; }
+  isSavingMember = true;
+  try {
+    var prenom = document.getElementById('newMemberPrenom').value.trim();
+    var nom = document.getElementById('newMemberNom').value.trim();
+    var phone = document.getElementById('newMemberPhone').value.trim();
+    var role = document.getElementById('newMemberRole').value;
+    if (!prenom || !nom) { showToast('Le prénom et le nom sont requis.', 'error'); return; }
+
+    if (role === 'admin') {
+      var adminCode = document.getElementById('newMemberAdminCode').value.trim();
+      if (!adminCode) { 
+        showToast('Code administrateur manquant.', 'error'); 
+        document.getElementById('newMemberAdminCode').focus();
+        return; 
+      }
+      if (adminCode !== '1958') { 
+        showToast('Code administrateur incorrect.', 'error'); 
+        document.getElementById('newMemberAdminCode').value = '';
+        document.getElementById('newMemberAdminCode').focus();
+        return; 
+      }
+    }
+
+    var pin = document.getElementById('newMemberPin').value.trim();
+    if (!pin || !/^\d{4}$/.test(pin)) {
+      showToast('Mot de passe invalide. 4 chiffres requis.', 'error');
+      document.getElementById('newMemberPin').focus();
+      return;
+    }
+
+    if (!/^[0-9]{8}$/.test(phone.replace(/\s/g, ''))) {
+      showToast('Numéro de téléphone invalide. 8 chiffres requis.', 'error');
+      document.getElementById('newMemberPhone').focus();
+      return;
+    }
+
+    // Vérifier si le numéro existe déjà afin de permettre la reconnexion lors de l'inscription
+    var existingUser = DB.membres.find(function(u) { return u.phone === phone; });
+    if (existingUser) {
+      showToast('Ce numéro possède déjà un compte.', 'error');
+      document.getElementById('newMemberPhone').focus();
+      return;
+    }
+
+    var newUser = {
+      id: 'user_' + Date.now(),
+      prenom: prenom,
+      nom: nom,
+      phone: phone,
+      pin: pin,
+      role: role === 'admin' ? 'admin' : 'membre',
+      avatar: ''
+    };
+    var result = await insertUser(newUser);
+    closeAddMemberModal();
+    var roleText = role === 'admin' ? ' administrateur' : '';
+    if (result.error) {
+      showToast('Membre' + roleText + ' ajouté (mode hors ligne, synchronisation différée).', 'warning');
+    } else {
+      showToast('Membre' + roleText + ' ajouté avec succès.', 'success');
+    }
+  } finally {
+    isSavingMember = false;
+  }
+}
+
+function openTotalWithdrawModal() {
+  if (!currentUser || currentUser.role !== 'admin') { showToast('Seul un administrateur peut retirer une somme globale.', 'error'); return; }
+  document.getElementById('totalWithdrawAmount').value = '';
+  document.getElementById('totalWithdrawReason').value = '';
+  document.getElementById('totalWithdrawMonth').value = '';
+  document.getElementById('totalWithdrawYear').value = new Date().getFullYear();
+  document.getElementById('totalWithdrawModal').classList.add('open');
+}
+
+function closeTotalWithdrawModal() {
+  document.getElementById('totalWithdrawModal').classList.remove('open');
+}
+
+// Retrait global avec guard anti double-clic
+async function saveTotalWithdrawal() {
+  if (isSavingTotalWithdrawal) { showToast('Retrait en cours...', 'info'); return; }
+  isSavingTotalWithdrawal = true;
+  var saveBtn = document.getElementById('totalWithdrawSaveBtn');
+  if (saveBtn) saveBtn.disabled = true;
+
+  function cleanup() {
+    isSavingTotalWithdrawal = false;
+    if (saveBtn) saveBtn.disabled = false;
+  }
+
+  try {
+    var amount = parseInt(document.getElementById('totalWithdrawAmount').value, 10);
+    var reason = document.getElementById('totalWithdrawReason').value.trim();
+    var chosenMonth = document.getElementById('totalWithdrawMonth').value;
+    var chosenYear = parseInt(document.getElementById('totalWithdrawYear').value, 10);
+
+    if (isNaN(amount) || amount <= 0) { showToast('Montant invalide.', 'error'); return; }
+    if (!reason) { showToast('Raison requise.', 'error'); return; }
+
+    var now = new Date();
+    var month = chosenMonth !== '' ? parseInt(chosenMonth, 10) : now.getMonth();
+    var year = (!isNaN(chosenYear) && chosenYear > 1900) ? chosenYear : now.getFullYear();
+
+    var cotObj = {
+      id: 'cot_' + Date.now(),
+      memberId: currentUser.id,
+      meetingId: null,
+      amount: -Math.abs(amount),
+      description: 'Retrait global: ' + reason,
+      date: new Date(year, month, 1).toISOString(),
+      month: month,
+      year: year,
+      day: new Date().getDate(),
+      time: new Date().toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+    };
+
+    var result = await insertCotisation(cotObj);
+
+    if (result.error) {
+      console.warn('Retrait global : erreur Supabase mais retrait conservé localement', result.error);
+      showToast('Retrait global enregistré localement (sync en attente).', 'warning');
+    } else {
+      showToast('Retrait global enregistré.', 'success');
+    }
+
+    closeTotalWithdrawModal();
+    renderCotisations(window.currentCotisationTab || 'all');
+
+    var authorName = currentUser ? currentUser.prenom + ' ' + currentUser.nom : 'Administrateur';
+    var announcementBody = 'Montant : ' + formatMoney(amount) + '. Raison : ' + reason + '.';
+    addAnnonce('Retrait global', announcementBody, authorName);
+  } catch (err) {
+    console.error('saveTotalWithdrawal error', err);
+    showToast('Erreur lors du retrait global.', 'error');
+  } finally {
+    cleanup();
+  }
+}
+
+function openWithdrawCotisationModal(memberId, currentTotal) {
+  if (!currentUser || currentUser.role !== 'admin') { showToast('Seul un administrateur peut retirer un montant.', 'error'); return; }
+  var member = DB.membres.find(function(u){ return u.id === memberId; });
+  if (!member) { showToast('Membre introuvable.', 'error'); return; }
+  var displayName = getFirstName(member.prenom || member.nom || '');
+  document.getElementById('withdrawMemberName').textContent = displayName + ' (Total actuel: ' + formatMoney(currentTotal) + ')';
+  document.getElementById('withdrawAmount').value = '';
+  document.getElementById('withdrawReason').value = '';
+  document.getElementById('withdrawModal').dataset.memberId = memberId;
+  document.getElementById('withdrawModal').classList.add('open');
+}
+
+function closeWithdrawModal() {
+  document.getElementById('withdrawModal').classList.remove('open');
+  delete document.getElementById('withdrawModal').dataset.memberId;
+}
+
+function saveWithdrawal() {
+  var memberId = document.getElementById('withdrawModal').dataset.memberId;
+  var amount = parseInt(document.getElementById('withdrawAmount').value, 10);
+  var reason = document.getElementById('withdrawReason').value.trim();
+  if (!memberId || isNaN(amount) || amount <= 0) { showToast('Montant de retrait invalide.', 'error'); return; }
+  if (!reason) { showToast('La raison du retrait est requise.', 'error'); return; }
+
+  var now = new Date();
+  var currentMonth = now.getMonth();
+  var currentYear = now.getFullYear();
+
+  var cotObj = {
+    id: 'cot_' + Date.now(),
+    memberId: memberId,
+    meetingId: null,
+    amount: -Math.abs(amount),
+    description: 'Retrait: ' + reason,
+    date: now.toISOString(),
+    month: currentMonth,
+    year: currentYear,
+    day: now.getDate(),
+    time: now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+  };
+  insertCotisation(cotObj).then(function() {
+    closeWithdrawModal();
+    renderCotisations(window.currentCotisationTab || 'all');
+    var authorName = currentUser ? currentUser.prenom + ' ' + currentUser.nom : 'Administrateur';
+    var annBody =
+      'Montant : ' + formatMoney(amount) + '. ' +
+      'Raison : ' + reason + '.';
+    addAnnonce('Retrait', annBody, authorName);
+    showToast('Retrait enregistré et annonce publiée.', 'success');
+  }).catch(function() {
+    showToast('Erreur lors du retrait.', 'error');
+  });
+}
+
+// Re-déclaration pour verrou anti double-clic des retraits individuels
+function saveWithdrawal() {
+  if (isSavingWithdrawal) { showToast('Retrait en cours...', 'info'); return; }
+  isSavingWithdrawal = true;
+  var saveBtn = document.getElementById('withdrawSaveBtn');
+  if (saveBtn) saveBtn.disabled = true;
+
+  function cleanup() {
+    isSavingWithdrawal = false;
+    if (saveBtn) saveBtn.disabled = false;
+  }
+
+  var memberId = document.getElementById('withdrawModal').dataset.memberId;
+  var amount = parseInt(document.getElementById('withdrawAmount').value, 10);
+  var reason = document.getElementById('withdrawReason').value.trim();
+  if (!memberId || isNaN(amount) || amount <= 0) { cleanup(); showToast('Montant de retrait invalide.', 'error'); return; }
+  if (!reason) { cleanup(); showToast('La raison du retrait est requise.', 'error'); return; }
+
+  var now = new Date();
+  var currentMonth = now.getMonth();
+  var currentYear = now.getFullYear();
+
+  var cotObj = {
+    id: 'cot_' + Date.now(),
+    memberId: memberId,
+    meetingId: null,
+    amount: -Math.abs(amount),
+    description: 'Retrait: ' + reason,
+    date: now.toISOString(),
+    month: currentMonth,
+    year: currentYear,
+    day: now.getDate(),
+    time: now.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })
+  };
+
+  insertCotisation(cotObj).then(function() {
+    closeWithdrawModal();
+    renderCotisations(window.currentCotisationTab || 'all');
+    var authorName = currentUser ? currentUser.prenom + ' ' + currentUser.nom : 'Administrateur';
+    var annBody = 'Montant : ' + formatMoney(amount) + '. Raison : ' + reason + '.';
+    addAnnonce('Retrait', annBody, authorName);
+    showToast('Retrait enregistré et annonce publiée.', 'success');
+    cleanup();
+  }).catch(function() {
+    showToast('Erreur lors du retrait.', 'error');
+    cleanup();
+  });
+}
+
+function switchCotisationTab(tab, btn) {
+  document.querySelectorAll('.tabs .tab-btn').forEach(function(b) { b.classList.remove('active'); });
+  btn.classList.add('active');
+  // track current tab so report/share buttons act immediately
+  window.currentCotisationTab = tab || 'all';
+  var shareGroup = document.getElementById('shareButtons');
+  // Only show share/download buttons in the 'all' tab
+  if (shareGroup) shareGroup.classList.toggle('hidden', tab !== 'all');
+  renderCotisations(tab);
+}
+
+// Download the report immediately according to the active cotisation tab
+function downloadReportForActiveTab() {
+  var tab = window.currentCotisationTab || 'all';
+  if (tab === 'monthly') {
+    generateReportPNG('monthly');
+  } else if (tab === 'yearly' || tab === 'annual') {
+    generateReportPNG('annual');
+  } else {
+    // fallback: open modal to let user choose
+    showDownloadReportModal();
+  }
+}
+
+// Share the report via WhatsApp according to the active cotisation tab
+function shareReportForActiveTab() {
+  var tab = window.currentCotisationTab || 'all';
+  if (tab === 'monthly') {
+    shareReportPNG('monthly');
+  } else if (tab === 'yearly' || tab === 'annual') {
+    shareReportPNG('annual');
+  } else {
+    showShareReportModal();
+  }
+}
+
+function buildReportData(type) {
+  var now = new Date();
+  var allCots = DB.cotisations.slice();
+  var entries = [];
+  var totalAmount = 0;
+  var reportMonthForSave = now.getMonth();
+
+  if (type === 'monthly') {
+    var reportMonth2 = (document.getElementById('monthFilter') && document.getElementById('monthFilter').value !== '') ? parseInt(document.getElementById('monthFilter').value) : now.getMonth();
+    reportMonthForSave = reportMonth2;
+
+    DB.membres.forEach(function(member) {
+      var sum = allCots.filter(function(c) {
+        return c.memberId === member.id && c.month === reportMonth2 && c.year === now.getFullYear() && c.amount > 0;
+      }).reduce(function(s, c) { return s + c.amount; }, 0);
+
+      entries.push({
+        name: member.prenom + ' ' + member.nom,
+        role: member.role === 'admin' ? 'Admin' : 'Membre',
+        amount: sum,
+        paid: sum > 0
+      });
+
+      totalAmount += sum;
+    });
+
+    entries.sort(function(a, b) { return a.name.localeCompare(b.name); });
+  } else {
+    var monthNames = ['Janvier', 'Février', 'Mars', 'Avril', 'Mai', 'Juin', 'Juillet', 'Août', 'Septembre', 'Octobre', 'Novembre', 'Décembre'];
+    for (var m = 0; m < 12; m++) {
+      var monthTotal = allCots.filter(function(c) { return c.month === m && c.year === now.getFullYear(); }).reduce(function(s, c) { return s + c.amount; }, 0);
+      entries.push({
+        name: monthNames[m],
+        role: '',
+        amount: monthTotal,
+        paid: monthTotal > 0
+      });
+      totalAmount += monthTotal;
+    }
+  }
+
+  return {
+    entries: entries,
+    totalAmount: totalAmount,
+    reportMonthForSave: reportMonthForSave
+  };
+}
+
+function generateReportPNG(type) {
+  var now = new Date();
+  var monthNames = ['Janvier', 'Février', 'Mars', 'Avril', 'Mai', 'Juin', 'Juillet', 'Août', 'Septembre', 'Octobre', 'Novembre', 'Décembre'];
+
+  var reportData = buildReportData(type);
+  var entries = reportData.entries;
+  var totalAmount = reportData.totalAmount;
+  var reportMonthForSave = reportData.reportMonthForSave;
+
+  // Data already built by buildReportData, no need to re-compute here.
+
+  // Calculate optimal row height and canvas height
+  var rowHeight = 140; // Reduced from 240 for better fit
+  var minCanvasHeight = 280 + 100 + (entries.length * rowHeight) + 220;
+  var canvasHeight = Math.max(2480, minCanvasHeight);
+
+  var canvas = document.createElement('canvas');
+  canvas.width = 1748;
+  canvas.height = canvasHeight;
+  var ctx = canvas.getContext('2d');
+  // Variables partagées entre drawReport() et finalizeAndDownload()
+  var totalAmountForSave = totalAmount;
+  var entriesForSave = entries;
+
+  function drawReport() {
+    // White background
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Header band
+    ctx.fillStyle = '#C0621A';
+    ctx.fillRect(0, 0, canvas.width, 280);
+
+    // Header title only (pas de cercle blanc au centre)
+    // Title "Famille Moro" in large bold - centered
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 112px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('Famille Moro', canvas.width / 2, 140);
+
+    // Report type and date/year
+    var reportMonth = now.getMonth();
+    var shortYear = now.getFullYear().toString().slice(-2);
+    if (type === 'monthly') {
+      var ms = (document.getElementById('monthFilter') && document.getElementById('monthFilter').value !== '') ? parseInt(document.getElementById('monthFilter').value) : now.getMonth();
+      reportMonth = ms;
+    }
+    
+    ctx.font = '56px Arial';
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.textAlign = 'left';
+    var dateStr = (type === 'monthly') ? ('Mois de ' + monthNames[reportMonth] + ' ' + now.getFullYear()) : ('Année ' + now.getFullYear());
+    ctx.fillText(dateStr, 560, 220);
+
+    // Draw table header
+    var yPos = 380;
+    
+    // Table header background (keep same look)
+    ctx.fillStyle = '#1B0E04';
+    ctx.fillRect(100, yPos - 60, 1548, 60);
+    
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 64px Arial'; // header labels × 4 larger
+    ctx.textAlign = 'left';
+    var headerLabel1 = (type === 'monthly') ? 'Nom et Prénom' : 'Mois';
+    ctx.fillText(headerLabel1, 130, yPos - 20);
+    if (type === 'monthly') {
+      ctx.fillText('Rôle', 700, yPos - 20);
+    }
+    ctx.fillText('Montant', 1200, yPos - 20);
+
+    yPos += 40; // Double the space from the black bar
+
+    // Draw rows
+    entries.forEach(function(entry, idx) {
+      // Alternating row background
+      if (idx % 2 === 1) {
+        ctx.fillStyle = 'rgba(192,98,26,0.06)';
+        ctx.fillRect(100, yPos - 60 + 10, 1548, rowHeight);
+      }
+      
+      // Text (adjust font for monthly vs annual)
+      ctx.fillStyle = '#1B0E04';
+      ctx.font = (type === 'monthly' ? '42px' : '32px') + ' Arial';
+      ctx.textAlign = 'left';
+      ctx.fillText(entry.name, 130, yPos);
+      if (type === 'monthly') {
+        ctx.fillText(entry.role || '', 700, yPos);
+      }
+      
+      ctx.textAlign = 'right';
+      var amountText;
+      if (type === 'monthly') {
+        amountText = entry.paid ? formatMoney(entry.amount) : "N'a pas cotisé";
+        ctx.fillStyle = entry.paid ? '#C0621A' : '#A0917E';
+      } else {
+        amountText = formatMoney(entry.amount);
+        ctx.fillStyle = '#C0621A';
+      }
+      ctx.font = (type === 'monthly' ? 'bold 42px' : 'bold 32px') + ' Arial';
+      ctx.fillText(amountText, 1600, yPos);
+      
+      yPos += rowHeight;
+    });
+
+    // Total line
+    yPos += 20;
+    ctx.strokeStyle = '#C0621A';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(100, yPos);
+    ctx.lineTo(1648, yPos);
+    ctx.stroke();
+    
+    yPos += 60;
+    ctx.fillStyle = '#C0621A';
+    ctx.font = 'bold 48px Arial'; // larger total label
+    ctx.textAlign = 'left';
+    ctx.fillText('TOTAL', 130, yPos);
+    ctx.textAlign = 'right';
+    ctx.fillText(formatMoney(totalAmount), 1600, yPos);
+
+    // Footer
+    yPos = canvas.height - 120;
+    ctx.fillStyle = '#1B0E04';
+    ctx.font = '48px Arial'; // footer × 2 larger
+    ctx.textAlign = 'center';
+    ctx.fillText('Généré le ' + new Date().toLocaleDateString('fr-FR') + ' — Cahier de Note - Famille Moro', canvas.width / 2, yPos);
+  }
+
+  function finalizeAndDownload() {
+    // ── Sauvegarde du rapport dans Supabase ──
+    var periodKey = (type === 'monthly')
+      ? (now.getFullYear() + '-' + String(reportMonthForSave + 1).padStart(2, '0'))
+      : String(now.getFullYear());
+    upsertRapport(type === 'monthly' ? 'monthly' : 'annual', periodKey, totalAmountForSave, entriesForSave);
+
+    function isIOS() {
+      return /iP(ad|hone|od)/.test(navigator.userAgent) || (navigator.platform && /MacIntel/.test(navigator.platform) && navigator.maxTouchPoints && navigator.maxTouchPoints > 1);
+    }
+    if (canvas.toBlob) {
+      canvas.toBlob(function(blob){
+        if (!blob) { var uri = canvas.toDataURL('image/png'); var link = document.createElement('a'); link.href = uri; link.download = 'rapport.png'; document.body.appendChild(link); link.click(); link.remove(); return; }
+        var url = URL.createObjectURL(blob);
+        if (isIOS()) {
+          try {
+            var dataUri = canvas.toDataURL('image/png');
+            window.open(dataUri, '_blank');
+            showToast('Image ouverte — appuyez longuement pour enregistrer', 'info');
+          } catch (e) {
+            window.open(url, '_blank');
+            showToast('Image ouverte — appuyez longuement pour enregistrer', 'info');
+            setTimeout(function(){ URL.revokeObjectURL(url); }, 20000);
+          }
+        } else {
+          var a = document.createElement('a'); a.href = url; a.download = (type==='monthly'? 'Rapport_Mensuel_' : 'Rapport_Annuel_') + now.getFullYear() + '.png'; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+        }
+      });
+    } else {
+      var uri2 = canvas.toDataURL('image/png');
+      if (/iP(ad|hone|od)/.test(navigator.userAgent)) {
+        window.open(uri2, '_blank');
+        showToast('Image ouverte — appuyez longuement pour enregistrer', 'info');
+      } else {
+        var link2 = document.createElement('a'); link2.href = uri2; link2.download = (type==='monthly'? 'Rapport_Mensuel_' : 'Rapport_Annuel_') + now.getFullYear() + '.png'; document.body.appendChild(link2); link2.click(); link2.remove();
+      }
+    }
+  }
+
+  // Draw the report background/header immediately
+  drawReport();
+  
+  // Load logo and finalize once it's drawn (or on error)
+  var logoImg = new Image();
+  logoImg.crossOrigin = 'anonymous';
+  logoImg.onload = function() {
+    try {
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(140, 140, 150, 0, Math.PI * 2);
+      ctx.closePath();
+      ctx.clip();
+      ctx.drawImage(logoImg, -10, -10, 300, 300);
+      ctx.restore();
+
+      // Ajouter le contour doré et l'ombre comme sur la page de connexion
+      ctx.save();
+      ctx.shadowColor = 'rgba(27, 14, 4, 0.15)';
+      ctx.shadowBlur = 20;
+      ctx.shadowOffsetX = 0;
+      ctx.shadowOffsetY = 4;
+      ctx.beginPath();
+      ctx.arc(140, 140, 150, 0, Math.PI * 2);
+      ctx.strokeStyle = '#D4A843';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.restore();
+    } catch (e) { console.warn('logo draw failed', e); }
+    // now that logo is in place, trigger download
+    finalizeAndDownload();
+  };
+  logoImg.onerror = function() {
+    console.warn('Erreur lors du chargement du logo');
+    // still finalize without logo
+    finalizeAndDownload();
+  };
+  logoImg.src = 'https://pfst.cf2.poecdn.net/base/image/9dd99bf015b592c535baf9de425d9bc0e79bf9432e46763c9cd4eaa61e48382d?w=708&h=760';
+}
+
+function showDownloadReportModal() {
+  document.getElementById('downloadReportModal').classList.add('open');
+  // Add Enter key listener
+  document.getElementById('downloadReportType').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') {
+      downloadSelectedReport();
+    }
+  });
+}
+
+function closeDownloadReportModal() {
+  document.getElementById('downloadReportModal').classList.remove('open');
+  // Remove listener
+  document.getElementById('downloadReportType').removeEventListener('keydown', function(e) {
+    if (e.key === 'Enter') {
+      downloadSelectedReport();
+    }
+  });
+}
+
+function downloadSelectedReport() {
+  var type = document.getElementById('downloadReportType').value;
+  closeDownloadReportModal();
+  try {
+    // small delay to ensure modal closed UI is flushed
+    setTimeout(function() { generateReportPNG(type); }, 50);
+    showToast('Téléchargement du rapport en cours...', 'success');
+  } catch (e) {
+    console.error('Erreur génération rapport:', e);
+    showToast('Erreur lors de la génération du rapport', 'error');
+  }
+}
+
+function showShareReportModal() {
+  document.getElementById('shareReportModal').classList.add('open');
+  // Add Enter key listener
+  document.getElementById('reportType').addEventListener('keydown', function(e) {
+    if (e.key === 'Enter') {
+      shareReportPNG();
+    }
+  });
+}
+
+function closeShareReportModal() {
+  document.getElementById('shareReportModal').classList.remove('open');
+  // Remove listener
+  document.getElementById('reportType').removeEventListener('keydown', function(e) {
+    if (e.key === 'Enter') {
+      shareReportPNG();
+    }
+  });
+}
+
+function shareReportPNG(type) {
+  if (!type) type = (document.getElementById('reportType') ? document.getElementById('reportType').value : 'monthly');
+  closeShareReportModal();
+  
+  var now = new Date();
+  var monthNames = ['Janvier', 'Février', 'Mars', 'Avril', 'Mai', 'Juin', 'Juillet', 'Août', 'Septembre', 'Octobre', 'Novembre', 'Décembre'];
+  
+  var reportData = buildReportData(type);
+  var entries = reportData.entries;
+  var totalAmount = reportData.totalAmount;
+  var reportMonthForSave = reportData.reportMonthForSave;
+
+  // Calculate optimal row height and canvas height
+  var rowHeight = 140; // Reduced from 240 for better fit
+  var minCanvasHeight = 280 + 100 + (entries.length * rowHeight) + 220;
+  var canvasHeight = Math.max(2480, minCanvasHeight);
+
+  var canvas = document.createElement('canvas');
+  canvas.width = 1748;
+  canvas.height = canvasHeight;
+  var ctx = canvas.getContext('2d');
+  // Variables partagées
+  var totalAmountForSave = totalAmount;
+  var entriesForSave = entries;
+
+  function drawReport() {
+    // White background
+    ctx.fillStyle = '#FFFFFF';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+    // Header band
+    ctx.fillStyle = '#C0621A';
+    ctx.fillRect(0, 0, canvas.width, 280);
+
+    // Header title only
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 112px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('Famille Moro', canvas.width / 2, 140);
+
+    // Report type and date/year
+    var reportMonth = now.getMonth();
+    if (type === 'monthly') {
+      var ms = (document.getElementById('monthFilter') && document.getElementById('monthFilter').value !== '') ? parseInt(document.getElementById('monthFilter').value) : now.getMonth();
+      reportMonth = ms;
+    }
+    
+    ctx.font = '56px Arial';
+    ctx.fillStyle = 'rgba(255,255,255,0.9)';
+    ctx.textAlign = 'left';
+    var dateStr = (type === 'monthly') ? ('Mois de ' + monthNames[reportMonth] + ' ' + now.getFullYear()) : ('Année ' + now.getFullYear());
+    ctx.fillText(dateStr, 560, 220);
+
+    // Draw table header
+    var yPos = 380;
+    
+    // Table header background
+    ctx.fillStyle = '#1B0E04';
+    ctx.fillRect(100, yPos - 60, 1548, 60);
+    
+    ctx.fillStyle = '#FFFFFF';
+    ctx.font = 'bold 64px Arial';
+    ctx.textAlign = 'left';
+    ctx.fillText(type === 'monthly' ? 'Nom et Prénom' : 'Mois', 130, yPos - 20);
+    if (type === 'monthly') {
+      ctx.fillText('Rôle', 700, yPos - 20);
+    }
+    ctx.fillText('Montant', 1200, yPos - 20);
+
+    yPos += 40;
+
+    // Draw rows
+    entries.forEach(function(entry, idx) {
+      if (idx % 2 === 1) {
+        ctx.fillStyle = 'rgba(192,98,26,0.06)';
+        ctx.fillRect(100, yPos - 60 + 10, 1548, rowHeight);
+      }
+      
+      ctx.fillStyle = '#1B0E04';
+      ctx.font = (type === 'monthly' ? '42px' : '32px') + ' Arial';
+      ctx.textAlign = 'left';
+      ctx.fillText(entry.name, 130, yPos);
+      if (type === 'monthly') {
+        ctx.fillText(entry.role || '', 700, yPos);
+      }
+      
+      ctx.textAlign = 'right';
+      var amountText;
+      if (type === 'monthly') {
+        amountText = entry.paid ? formatMoney(entry.amount) : "N'a pas cotisé";
+        ctx.fillStyle = entry.paid ? '#C0621A' : '#A0917E';
+      } else {
+        amountText = formatMoney(entry.amount);
+        ctx.fillStyle = '#C0621A';
+      }
+      ctx.font = (type === 'monthly' ? 'bold 42px' : 'bold 32px') + ' Arial';
+      ctx.fillText(amountText, 1600, yPos);
+      
+      yPos += rowHeight;
+    });
+
+    // Total line
+    yPos += 20;
+    ctx.strokeStyle = '#C0621A';
+    ctx.lineWidth = 4;
+    ctx.beginPath();
+    ctx.moveTo(100, yPos);
+    ctx.lineTo(1648, yPos);
+    ctx.stroke();
+    
+    yPos += 60;
+    ctx.fillStyle = '#C0621A';
+    ctx.font = 'bold 48px Arial';
+    ctx.textAlign = 'left';
+    ctx.fillText('TOTAL', 130, yPos);
+    ctx.textAlign = 'right';
+    ctx.fillText(formatMoney(totalAmount), 1600, yPos);
+
+    // Footer
+    yPos = canvas.height - 120;
+    ctx.fillStyle = '#1B0E04';
+    ctx.font = '48px Arial';
+    ctx.textAlign = 'center';
+    ctx.fillText('Généré le ' + new Date().toLocaleDateString('fr-FR') + ' — Cahier de Note - Famille Moro', canvas.width / 2, yPos);
+  }
+
+  // Draw the report background/header immediately
+  drawReport();
+  
+  // Load logo and finalize
+  var logoImg = new Image();
+  logoImg.crossOrigin = 'anonymous';
+  logoImg.onload = function() {
+    try {
+      ctx.save();
+      ctx.beginPath();
+      ctx.arc(140, 140, 150, 0, Math.PI * 2);
+      ctx.closePath();
+      ctx.clip();
+      ctx.drawImage(logoImg, -10, -10, 300, 300);
+      ctx.restore();
+
+      ctx.save();
+      ctx.shadowColor = 'rgba(27, 14, 4, 0.15)';
+      ctx.shadowBlur = 20;
+      ctx.shadowOffsetX = 0;
+      ctx.shadowOffsetY = 4;
+      ctx.beginPath();
+      ctx.arc(140, 140, 150, 0, Math.PI * 2);
+      ctx.strokeStyle = '#D4A843';
+      ctx.lineWidth = 3;
+      ctx.stroke();
+      ctx.restore();
+    } catch (e) { console.warn('logo draw failed', e); }
+
+    // ── Sauvegarde du rapport dans Supabase avant partage ──
+    var sharePeriodKey = (type === 'monthly')
+      ? (now.getFullYear() + '-' + String(reportMonthForSave + 1).padStart(2, '0'))
+      : String(now.getFullYear());
+    upsertRapport(type === 'monthly' ? 'monthly' : 'annual', sharePeriodKey, totalAmountForSave, entriesForSave);
+
+    // Share the PNG
+    canvas.toBlob(function(blob) {
+      var file = new File([blob], 'Rapport_' + (type === 'monthly' ? 'Mensuel' : 'Annuel') + '_' + now.getFullYear() + '.png', { type: 'image/png' });
+      
+      if (navigator.share && navigator.canShare && navigator.canShare({ files: [file] })) {
+        navigator.share({
+          title: 'Rapport ' + (type === 'monthly' ? 'Mensuel' : 'Annuel') + ' - Famille Moro',
+          files: [file]
+        }).then(function() {
+          showToast('Rapport partagé avec succès !', 'success');
+        }).catch(function(error) {
+          if (error.name !== 'AbortError') {
+            console.error('Erreur lors du partage:', error);
+            showToast('Erreur lors du partage. Téléchargement de l\'image...', 'error');
+            var url = URL.createObjectURL(blob);
+            var a = document.createElement('a');
+            a.href = url;
+            a.download = file.name;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            URL.revokeObjectURL(url);
+            showToast('Image téléchargée. Ouvrez WhatsApp et partagez-la.', 'success');
+          }
+        });
+      } else {
+        var url = URL.createObjectURL(blob);
+        var isiOS = /iP(ad|hone|od)/.test(navigator.userAgent) || (navigator.platform && /MacIntel/.test(navigator.platform) && navigator.maxTouchPoints && navigator.maxTouchPoints > 1);
+        if (isiOS) {
+          try {
+            var dataUri2 = canvas.toDataURL('image/png');
+            window.open(dataUri2, '_blank');
+            showToast('Image ouverte — appuyez longuement pour enregistrer', 'info');
+          } catch (e) {
+            window.open(url, '_blank');
+            showToast('Image ouverte — appuyez longuement pour enregistrer', 'info');
+            setTimeout(function(){ URL.revokeObjectURL(url); }, 20000);
+          }
+        } else {
+          var a = document.createElement('a');
+          a.href = url;
+          a.download = file.name;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+          showToast('Image téléchargée. Ouvrez WhatsApp et partagez-la.', 'success');
+        }
+      }
+    });
+  };
+  logoImg.onerror = function() {
+    showToast('Erreur lors du chargement du logo', 'error');
+  };
+  logoImg.src = document.getElementById('mainLogo').src;
+}
+
+function shareWhatsApp(type) {
+  var now = new Date();
+  var monthNames = ['Janvier', 'Février', 'Mars', 'Avril', 'Mai', 'Juin', 'Juillet', 'Août', 'Septembre', 'Octobre', 'Novembre', 'Décembre'];
+  var report = '';
+  var waEntries = [];
+  var waTotal = 0;
+
+  if (type === 'monthly') {
+    var curMonth = now.getMonth();
+    var curYear = now.getFullYear();
+    var monthCots = DB.cotisations.filter(function(c) { return c.month === curMonth && c.year === curYear; });
+    waTotal = monthCots.reduce(function(s, c) { return s + c.amount; }, 0);
+    report = '📋 *RAPPORT COTISATIONS - ' + monthNames[curMonth] + ' ' + curYear + '*\n';
+    report += '*Famille Moro*\n\n';
+    monthCots.forEach(function(c) {
+      var member = DB.membres.find(function(u) { return u.id === c.memberId; });
+      var mName = member ? member.nom + ' ' + member.prenom : 'Inconnu';
+      report += '• ' + mName + ' : ' + formatMoney(c.amount) + '\n';
+      report += '  _' + c.description + ' - ' + formatDateTime(c.date) + '_\n';
+      waEntries.push({ name: mName, amount: c.amount });
+    });
+    report += '\n💰 *Total du mois : ' + formatMoney(waTotal) + '*';
+
+    // Sauvegarder rapport mensuel dans Supabase
+    var waPeriodKey = curYear + '-' + String(curMonth + 1).padStart(2, '0');
+    upsertRapport('monthly', waPeriodKey, waTotal, waEntries);
+
+  } else {
+    var yearCots = DB.cotisations.filter(function(c) { return c.year === now.getFullYear(); });
+    waTotal = yearCots.reduce(function(s, c) { return s + c.amount; }, 0);
+    report = '📋 *RAPPORT COTISATIONS ANNUEL - ' + now.getFullYear() + '*\n';
+    report += '*Famille Moro*\n\n';
+
+    var byMonth = {};
+    yearCots.forEach(function(c) {
+      if (!byMonth[c.month]) byMonth[c.month] = [];
+      byMonth[c.month].push(c);
+    });
+
+    Object.keys(byMonth).sort(function(a, b) { return a - b; }).forEach(function(m) {
+      var mTotal = byMonth[m].reduce(function(s, c) { return s + c.amount; }, 0);
+      report += '*' + monthNames[m] + '* : ' + formatMoney(mTotal) + '\n';
+      byMonth[m].forEach(function(c) {
+        var member = DB.membres.find(function(u) { return u.id === c.memberId; });
+        var mName = member ? member.nom + ' ' + member.prenom : 'Inconnu';
+        report += '  • ' + mName + ' : ' + formatMoney(c.amount) + '\n';
+        waEntries.push({ name: mName, month: parseInt(m), amount: c.amount });
+      });
+      report += '\n';
+    });
+    report += '💰 *Total annuel : ' + formatMoney(waTotal) + '*';
+
+    // Sauvegarder rapport annuel dans Supabase
+    upsertRapport('annual', String(now.getFullYear()), waTotal, waEntries);
+  }
+
+  var url = 'https://wa.me/?text=' + encodeURIComponent(report);
+  window.open(url, '_blank');
+}
+
+/* ===========================================================
+   NOTES
+   =========================================================== */
+function renderNotes() {
+  var container = document.getElementById('notesList');
+  var emptyEl = document.getElementById('notesEmpty');
+  container.innerHTML = '';
+
+  var userNotes = DB.notes.filter(function(n) { return n.userId === currentUser.id; });
+  userNotes.sort(function(a, b) { return new Date(b.updatedAt) - new Date(a.updatedAt); });
+
+  if (userNotes.length === 0) {
+    emptyEl.classList.remove('hidden');
+    return;
+  }
+  emptyEl.classList.add('hidden');
+
+  // Group notes by meeting
+  var notesByMeeting = {};
+  userNotes.forEach(function(n) {
+    var meetingKey = n.meetingId || 'free_' + n.id;
+    if (!notesByMeeting[meetingKey]) {
+      notesByMeeting[meetingKey] = {
+        meeting: n.meetingId ? DB.meetings.find(function(m) { return m.id === n.meetingId; }) : null,
+        notes: []
+      };
+    }
+    notesByMeeting[meetingKey].notes.push(n);
+  });
+
+  Object.keys(notesByMeeting).forEach(function(meetingKey) {
+    var meetingData = notesByMeeting[meetingKey];
+    var meeting = meetingData.meeting;
+    
+    var card = document.createElement('div');
+    card.className = 'note-card';
+    
+    var headerText = meeting ? formatDate(meeting.date) + ' — ' + escapeHtml(meeting.titles.join(' • ')) : 'Note libre';
+    
+    var notesContent = '';
+    if (meeting) {
+      // Sort notes by titleIndex
+      meetingData.notes.sort(function(a, b) { return (a.titleIndex || 0) - (b.titleIndex || 0); });
+      
+      meetingData.notes.forEach(function(note) {
+        var titleText = meeting.titles[note.titleIndex] || 'Titre inconnu';
+        notesContent += '<div class="note-section"><strong>' + (note.titleIndex + 1) + '. ' + escapeHtml(titleText) + ':</strong><br>' + escapeHtml(note.content) + '</div>';
+      });
+    } else {
+      // Free note
+      var freeNote = meetingData.notes[0];
+      notesContent = '<div class="note-section" id="note-content-' + freeNote.id + '">' +
+        '<div class="note-title-display" id="note-title-display-' + freeNote.id + '"><strong>' + escapeHtml(freeNote.title || 'Note libre') + '</strong></div>' +
+        '<div class="note-content-display" id="note-content-display-' + freeNote.id + '">' + escapeHtml(freeNote.content).replace(/\n/g, '<br>') + '</div>' +
+        '<div class="note-edit-controls" id="note-edit-controls-' + freeNote.id + '" style="display:none;margin-top:8px;">' +
+          '<input type="text" class="form-input" id="edit-title-' + freeNote.id + '" value="' + escapeHtml(freeNote.title || '') + '" placeholder="Titre de la note" style="margin-bottom:8px;">' +
+          '<textarea class="note-textarea" id="edit-content-' + freeNote.id + '" placeholder="Contenu de la note" style="min-height:120px;margin-bottom:8px;">' + escapeHtml(freeNote.content) + '</textarea>' +
+          '<div style="display:flex;gap:8px;">' +
+            '<button class="btn btn-primary btn-small" onclick="saveNoteEdit(\'' + freeNote.id + '\')">Sauvegarder</button>' +
+            '<button class="btn btn-secondary btn-small" onclick="cancelNoteEdit(\'' + freeNote.id + '\')">Annuler</button>' +
+          '</div>' +
+        '</div>' +
+      '</div>';
+    }
+    
+    var actionButtons = '';
+    if (!meeting) {
+      // Free note - add edit button
+      actionButtons = '<div style="display:flex;gap:4px;">' +
+        '<button class="btn btn-icon btn-secondary" onclick="editNote(\'' + meetingData.notes[0].id + '\')" style="width:32px;height:32px;font-size:13px" title="Modifier"><i class="fas fa-edit"></i></button>' +
+        '<button class="btn btn-icon btn-secondary" onclick="deleteMeetingNotes(\'' + meetingKey + '\')" style="width:32px;height:32px;font-size:13px" title="Supprimer"><i class="fas fa-trash" style="color:var(--danger)"></i></button>' +
+      '</div>';
+    } else {
+      // Meeting notes - only delete button
+      actionButtons = '<button class="btn btn-icon btn-secondary" onclick="deleteMeetingNotes(\'' + meetingKey + '\')" style="width:32px;height:32px;font-size:13px"><i class="fas fa-trash" style="color:var(--danger)"></i></button>';
+    }
+    
+    card.innerHTML =
+      '<div class="note-card-header">' +
+        '<span class="note-card-date">' + headerText + '</span>' +
+        actionButtons +
+      '</div>' +
+      '<div class="note-content">' + notesContent + '</div>';
+    
+    container.appendChild(card);
+  });
+}
+
+function addNewNote() {
+  document.getElementById('newNoteTitle').value = '';
+  document.getElementById('newNoteContent').value = '';
+  document.getElementById('newNoteModal').classList.add('open');
+  document.getElementById('newNoteTitle').focus();
+}
+
+function closeNewNoteModal() {
+  document.getElementById('newNoteModal').classList.remove('open');
+}
+
+function saveNewNote() {
+  if (isSavingNote) { showToast('Enregistrement en cours...', 'info'); return; }
+  isSavingNote = true;
+
+  function cleanup() {
+    isSavingNote = false;
+  }
+
+  var title = document.getElementById('newNoteTitle').value.trim();
+  var content = document.getElementById('newNoteContent').value.trim();
+  
+  if (!title) {
+    showToast('Veuillez entrer un titre pour la note', 'error');
+    document.getElementById('newNoteTitle').focus();
+    cleanup();
+    return;
+  }
+  
+  var noteId = Date.now().toString();
+  var noteObj = {
+    id: noteId,
+    meetingId: null,
+    userId: currentUser.id,
+    title: title,
+    content: content,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString()
+  };
+  insertNote(noteObj).then(function(){
+    closeNewNoteModal();
+    renderNotes();
+    showToast('Nouvelle note créée !', 'success');
+    cleanup();
+  }).catch(function(err) {
+    console.error('Error saving note:', err);
+    showToast('Erreur lors de la sauvegarde de la note', 'error');
+    cleanup();
+  });
+}
+
+function deleteMeetingNotes(meetingKey) {
+  showConfirmDialog('Supprimer toutes les notes de cette réunion ?', function() {
+    // Delete remotely and update local DB
+    deleteNotesForMeetingData(meetingKey).then(function(){
+      showToast('Notes supprimées', 'success');
+    });
+  });
+}
+
+function editNote(noteId) {
+  document.getElementById('note-title-display-' + noteId).style.display = 'none';
+  document.getElementById('note-content-display-' + noteId).style.display = 'none';
+  document.getElementById('note-edit-controls-' + noteId).style.display = 'block';
+  document.getElementById('edit-title-' + noteId).focus();
+}
+
+function saveNoteEdit(noteId) {
+  var newTitle = document.getElementById('edit-title-' + noteId).value.trim();
+  var newContent = document.getElementById('edit-content-' + noteId).value;
+  
+  if (!newTitle) {
+    showToast('Le titre ne peut pas être vide', 'error');
+    return;
+  }
+  
+  var note = DB.notes.find(function(n) { return n.id === noteId; });
+  if (note) {
+    note.title = newTitle;
+    note.content = newContent;
+    note.updatedAt = new Date().toISOString();
+    // Persist to Supabase
+    sb.from('notes').update({ title: newTitle, content: newContent, updated_at: note.updatedAt }).eq('id', noteId).then(function(){});
+    renderNotes();
+    showToast('Note mise à jour !', 'success');
+  }
+}
+
+function cancelNoteEdit(noteId) {
+  document.getElementById('note-title-display-' + noteId).style.display = 'block';
+  document.getElementById('note-content-display-' + noteId).style.display = 'block';
+  document.getElementById('note-edit-controls-' + noteId).style.display = 'none';
+}
+
+/* ===========================================================
+   SETTINGS
+   =========================================================== */
+function saveSettings() {
+  if (isSavingSettings) { showToast('Enregistrement en cours...', 'info'); return; }
+  isSavingSettings = true;
+
+  function cleanup() {
+    isSavingSettings = false;
+  }
+
+  var nom = document.getElementById('settingsNom').value.trim();
+  var prenom = document.getElementById('settingsPrenom').value.trim();
+  var phone = getPhone('settingsPhone');
+  var newPin = getPin('settings');
+
+  if (!nom || !prenom) { showToast('Nom et prénom requis'); cleanup(); return; }
+  if (phone.replace(/ /g, '').length !== 8) { showToast('Numéro incomplet'); cleanup(); return; }
+
+  currentUser.nom = nom;
+  currentUser.prenom = prenom;
+  currentUser.phone = phone;
+  if (newPin.length === 4) currentUser.pin = newPin;
+
+  // Update photo if changed
+  var settingsAvatarSrc = document.getElementById('settingsAvatar').src;
+  if (settingsAvatarSrc && settingsAvatarSrc !== currentUser.avatar) {
+    currentUser.avatar = settingsAvatarSrc;
+  }
+
+  // Update DB
+  var idx = DB.membres.findIndex(function(u) { return u.id === currentUser.id; });
+  if (idx !== -1) updateUser(currentUser);
+
+  initDashboard();
+  showToast('Informations mises à jour !');
+  cleanup();
+}
+
+/* ===========================================================
+   HELPERS
+   =========================================================== */
+function escapeHtml(str) {
+  if (!str) return '';
+  var div = document.createElement('div');
+  div.appendChild(document.createTextNode(str));
+  return div.innerHTML;
+}
+
+function formatDate(dateStr) {
+  var d = new Date(dateStr);
+  var options = { day: 'numeric', month: 'long', year: 'numeric' };
+  return d.toLocaleDateString('fr-FR', options);
+}
+
+function formatDateTime(isoStr) {
+  var d = new Date(isoStr);
+  return d.toLocaleDateString('fr-FR', { day: 'numeric', month: 'short', year: 'numeric' }) +
+    ' à ' + d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+}
+
+function formatMoney(amount) {
+  return amount.toString().replace(/\B(?=(\d{3})+(?!\d))/g, ' ') + ' FCFA';
+}
+
+/* Demo data removed: no default users are injected. All users shown come from real registrations. */
+
+/* ===========================================================
+   EVENT LISTENERS
+   =========================================================== */
+document.getElementById('loginBtn').addEventListener('click', handleLogin);
+
+// Add Enter key listeners for login and register
+document.addEventListener('keydown', handleLoginEnter);
+document.addEventListener('keydown', handleRegisterEnter);
